@@ -1,0 +1,24 @@
+menu-change-payload — executable bundle for the Menu Change Workflow (union).
+Companion to menu-change-workflow.md (instructions). Materialize these files
+to their relative paths, then `bash setup.sh`.
+
+LOCKED ORIGINALS (do not edit these shipped bytes; report fidelity depends on
+them being unchanged at run time. This is not a constraint on reimplementing
+the same behaviour as native CLI verbs — see APPROVAL.md "Standing intent"):
+  scripts/*.py  — taken from part1/part2 scripts.zip (clean UTF-8), including
+                  price_inference.py and ocr_sanity_check.py which lean v3 lacked.
+  references/cuisine-*.md, references/ocr-prompt.md — set2 (clean UTF-8 + richer OCR).
+  references/price-inference.md, references/tested-restaurants.md — union extracts.
+  setup.sh — set2 (EOL-identical to lean after CRLF strip).
+
+HOOK: hooks/menu_change_done_gate.py is set2 + approved union patch
+(require price_inference.py in the P1 stop-gate + list it in BLOCK_REASON).
+
+v4.3 AMENDMENT (Party Tray) — deliberate maintainer edit to locked scripts.
+The fidelity lock still applies at RUN time to these new bytes. Changed:
+  scripts/action2_ocr_to_2b_0625v2.py, scripts/action3_compare_and_merge.py,
+  scripts/price_inference.py, scripts/ocr_sanity_check.py,
+  references/price-inference.md, references/cuisine-chinese-american.md.
+Unchanged: action1, action4, action5, modifier_rule_pricing, bridge,
+  crop_section, price_queue_gate, part2_report, hook, setup.sh.
+See ../CHANGELOG.md.
