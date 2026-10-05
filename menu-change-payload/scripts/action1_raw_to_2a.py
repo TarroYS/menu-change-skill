@@ -17,8 +17,20 @@ What it does:
     Reads the complex multi-tab Raw Excel 1 system spreadsheet and produces
     a simplified Excel 2a with:
       - price tab: Dish Group, Dish Name:Primary, Dish Name:Secondary, + price variant columns
-      - dish_code tab: same row layout as price, cells carry per-variant dish codes
+      - System Codes tab: same row layout as price, cells carry each size's dish
+        code (unit_code) — action3 builds the report's Dish Code tab from it.
+        (Deliberately not named 'dish_code': that name would switch on action2's
+        dormant code tie-break in name matching.)
       - modifier tab: Dish Group, Modifier Group, Modifier Name:Primary/Secondary, + price variants
+      - absolute_pricing tab (v4.4): $0.00 dish cells whose price lives on
+        modifiers (priced modifier_rule rows for the dish or for its dish group,
+        or a required, fully priced modifier group — and, in a restaurant that
+        prices dishes on modifier rules, every $0.00 Fried Specialties dish).
+        action2 never writes a paper price onto them and price_inference never
+        infers one (G11 — it would double-charge).
+      - side_rules tab: dishes with priced dish-level modifier_rule rows (side
+        combos). action2 warns when the OCR JSON reads such a dish without a
+        multi-column (side_pricing) table — no Fried Specialty tab otherwise.
 
 Inclusion rules (discovered by reverse-engineering the Raw Excel 1 → Excel 2a relationship):
     Price tab items must:
@@ -65,6 +77,10 @@ PRICE_VARIANTS = [
 ]
 
 SIDE_CHOICE_PREFIX = 'Select '  # Modifier groups starting with "Select " are side choice groups
+
+# Base-price anchor names on an ABSOLUTE dish's modifier_rule rows (whole name,
+# normalized). Keep in sync with modifier_rule_pricing.py BY_ITSELF_ALIASES.
+BY_ITSELF_ALIASES = {'by itself', 'plain', 'no rice', 'no side'}
 
 HEADER_FILL = PatternFill('solid', fgColor='D9E1F2')
 HEADER_FONT = Font(bold=True, size=11)
@@ -163,6 +179,8 @@ def _parse_code(val) -> Optional[str]:
     """Parse a dish-code cell into a clean string. Returns None for empty."""
     if val is None:
         return None
+    if isinstance(val, float) and val.is_integer():
+        val = int(val)                  # a code stored as a number: 48, not '48.0'
     s = str(val).strip()
     if s in ('', 'None', 'NULL'):
         return None
@@ -185,6 +203,21 @@ def _find_col_with_path(headers: list, row2: list, name: str, path_contains: str
     return None
 
 
+def _is_fried_specialty_group(group: str) -> bool:
+    """'Fried Specialties', 'Fried Specialty', 'Fried Specialties::RPOS' …
+    (the same test modifier_rule_pricing.py uses)."""
+    return bool(group) and 'fried special' in group.lower()
+
+
+def _is_by_itself(name: str) -> bool:
+    """True if a modifier_item name IS a base-price anchor alias (whole name)."""
+    s = str(name).lower().strip()
+    s = re.sub(r'\s*\([^)]*\)\s*', ' ', s)
+    s = s.replace('w.', 'with').replace('&', 'and')
+    s = re.sub(r'[^a-z0-9\s]', '', s)
+    return re.sub(r'\s+', ' ', s).strip() in BY_ITSELF_ALIASES
+
+
 # ── Raw Excel 1 Reader ────────────────────────────────────────────
 
 class RawExcel1Reader:
@@ -199,6 +232,7 @@ class RawExcel1Reader:
         self._read_dish_item()
         self._read_modifier_group()
         self._read_modifier_item()
+        self._read_modifier_rule()
 
     def close(self):
         self.wb.close()
@@ -302,6 +336,12 @@ class RawExcel1Reader:
         col_zh = _find_col_with_path(headers, row2, 'i18n_names:zh_cn', 'root_wprop.name_complex')
         price_cols = _find_unit_price_cols(headers, row2)
         code_cols = _find_unit_code_cols(headers, row2)
+        # The dish's own modifier groups ('comprise → modifier_group'; a second
+        # 'modifier_group' header under sort_coordinate is only an ordering hint).
+        mg_cols = [i for i, h in enumerate(headers) if h == 'modifier_group']
+        col_mg = next((i for i in mg_cols if i < len(rows[0])
+                       and str(rows[0][i] or '').strip() == 'comprise'),
+                      mg_cols[0] if mg_cols else None)
 
         if col_name is None:
             print("ERROR: dish_item tab missing 'dish_item' column")
@@ -311,8 +351,16 @@ class RawExcel1Reader:
         self.dish_codes = {}        # name → {variant: str}
         self.dish_zh = {}           # name → chinese name
         self.dish_root_counts = Counter()
+        self.dish_modifier_groups = defaultdict(list)  # name → [modifier_group]
 
+        current = None
         for r in rows[3:]:
+            if _is_root_row(r):
+                current = str(r[col_name]).strip() if col_name < len(r) and r[col_name] else ''
+            mg = str(r[col_mg]).strip() if col_mg is not None and col_mg < len(r) and r[col_mg] else ''
+            owner = (str(r[col_name]).strip() if col_name < len(r) and r[col_name] else '') or current
+            if mg and owner and mg not in self.dish_modifier_groups[owner]:
+                self.dish_modifier_groups[owner].append(mg)
             if not _is_root_row(r):
                 continue
             name = str(r[col_name]).strip() if col_name < len(r) and r[col_name] else ''
@@ -354,7 +402,10 @@ class RawExcel1Reader:
 
         col_mg = _find_col(headers, 'modifier_group')
         col_mi = _find_col(headers, 'modifier_item')
+        col_min = _find_col(headers, 'min_number_of_selections')
+        col_sub = _find_col(headers, 'subtype')
 
+        self.mg_required = set()        # groups the customer MUST pick from
         if col_mg is None or col_mi is None:
             print("WARNING: modifier_group tab missing columns, modifier tab will be empty")
             self.mg_items = OrderedDict()
@@ -372,6 +423,10 @@ class RawExcel1Reader:
                 current = mg
                 if current not in self.mg_items:
                     self.mg_items[current] = []
+                mn = _parse_price(r[col_min]) if col_min is not None and col_min < len(r) else None
+                sub = str(r[col_sub]).strip().lower() if col_sub is not None and col_sub < len(r) and r[col_sub] else ''
+                if (mn is not None and mn >= 1) or sub == 'required':
+                    self.mg_required.add(current)
 
             if mi and current and mi not in self.mg_items[current]:
                 self.mg_items[current].append(mi)
@@ -430,6 +485,40 @@ class RawExcel1Reader:
                 if p is not None:
                     prices[v] = p
             self.mod_prices[name] = prices
+
+    # ── modifier_rule tab (optional) ──────────────────────────────
+
+    def _read_modifier_rule(self):
+        """Priced modifier_rule rows, by header text (G4): dish-level rows (they
+        name a dish_item) and group-level rows (only a dish_group — they apply
+        to every dish in that group). Used to find $0.00 dishes whose price
+        lives on modifier rules (ABSOLUTE) and to list the side-rule dishes."""
+        self.mr_rules = []              # [{'dish','variant','mod','mg','price'}]
+        self.mr_group_rules = []        # [{'group','variant','mod','mg','price'}]
+        if 'modifier_rule' not in self.wb.sheetnames:
+            return
+        rows, headers, _ = self._get_rows_and_headers('modifier_rule')
+        cols = {k: _find_col(headers, k) for k in
+                ('out_unit_price', 'dish_group', 'dish_item', 'variant', 'modifier_group',
+                 'modifier_item')}
+        if cols['out_unit_price'] is None or cols['dish_item'] is None:
+            return
+
+        def _v(r, k):
+            ci = cols[k]
+            return str(r[ci]).strip() if ci is not None and ci < len(r) and r[ci] else ''
+
+        for r in rows[3:]:
+            dish, group = _v(r, 'dish_item'), _v(r, 'dish_group')
+            price = _parse_price(r[cols['out_unit_price']]) if cols['out_unit_price'] < len(r) else None
+            if price is None:
+                continue
+            rule = {'variant': _v(r, 'variant'), 'mod': _v(r, 'modifier_item'),
+                    'mg': _v(r, 'modifier_group'), 'price': price}
+            if dish:
+                self.mr_rules.append({'dish': dish, **rule})
+            elif group:
+                self.mr_group_rules.append({'group': group, **rule})
 
 
 # ── Excel 2a Generator ────────────────────────────────────────────
@@ -580,6 +669,156 @@ class Excel2aGenerator:
 
         return rows
 
+    def _get_absolute_cells(self, dishes) -> List[Tuple[str, str, str, str, Optional[float], str]]:
+        """$0.00 dish prices whose real price lives on modifiers (ABSOLUTE
+        pricing). A paper price written onto one of these cells is charged ON
+        TOP of the modifier price — the v4.3 double charge (wings $7.99 on the
+        dish + the wings-with-fries rule's full $9.39 = $17.38) — so Part 1
+        never writes one (G11). Two structures, both read from the raw:
+          modifier_rule  — priced dish-level modifier_rule rows for this dish and
+                           variant (or variant-less): By Itself carries the
+                           base, each side rule the full total.
+          modifier_group — a REQUIRED modifier group on the dish or its dish
+                           group whose every item is priced for this variant
+                           (e.g. R85325 Seafood Boil $0.00 → Select Seafood Boil).
+        Returns [(group, dish, variant, source, by_itself_price, evidence,
+        modifier_group)], one per (dish, variant), in Menu Preview order."""
+        dish_groups = defaultdict(list)
+        for g, ds in self.r.group_dishes.items():
+            for d in ds:
+                dish_groups[d].append(g)
+        def _shown(rules):
+            txt = ', '.join(f"{x['mod'] or x['mg'] or '?'} {_fmt(x['price'])}" for x in rules[:4])
+            return txt + (f' (+{len(rules) - 4} more)' if len(rules) > 4 else '')
+
+        out, seen = [], set()
+        for group, dish, _zh, prices in dishes:
+            for v, p in prices.items():
+                if abs(p) > 0.001 or (dish, v) in seen:
+                    continue
+                rules = [x for x in self.r.mr_rules
+                         if x['dish'] == dish and x['variant'] in ('', v) and x['price'] > 0.001]
+                if rules:
+                    by_itself = next((x['price'] for x in rules if _is_by_itself(x['mod'])), None)
+                    out.append((group, dish, v, 'modifier_rule', by_itself,
+                                f'{len(rules)} priced modifier_rule row(s): {_shown(rules)}', ''))
+                    seen.add((dish, v))
+                    continue
+                # Group-level rules (no dish_item, only a dish_group) price every
+                # dish of that group the same way — but only a priced By Itself,
+                # or rules on a REQUIRED choice, mean the price lives there: a
+                # group-level add-on ("Sauce / With +$1.00", real R85325) is
+                # just an upcharge.
+                grules = [x for x in getattr(self.r, 'mr_group_rules', [])
+                          if x['group'] in dish_groups.get(dish, []) and x['variant'] in ('', v)
+                          and x['price'] > 0.001]
+                if grules and self._holds_price(grules):
+                    by_itself = next((x['price'] for x in grules if _is_by_itself(x['mod'])), None)
+                    out.append((group, dish, v, 'modifier_rule', by_itself,
+                                f"{len(grules)} priced group-level modifier_rule row(s) on dish "
+                                f"group '{grules[0]['group']}': {_shown(grules)}", ''))
+                    seen.add((dish, v))
+                    continue
+                mgs = list(self.r.dish_modifier_groups.get(dish, []))
+                for g in dish_groups.get(dish, []):
+                    mgs += [m for m in self.r.group_modifier_groups.get(g, []) if m not in mgs]
+                for mg in mgs:
+                    items = self.r.mg_items.get(mg, [])
+                    if mg not in self.r.mg_required or not items:
+                        continue
+                    ip = [self.r.mod_prices.get(it, {}).get(v) for it in items]
+                    if all(x is not None and x > 0.001 for x in ip):
+                        out.append((group, dish, v, 'modifier_group', None,
+                                    f"required modifier group '{mg}': all {len(items)} items "
+                                    f"priced ({_fmt(min(ip))}–{_fmt(max(ip))})", mg))
+                        seen.add((dish, v))
+                        break
+        # Maintainer (2026-09-30): in a restaurant that prices dishes on
+        # modifier rules (ABSOLUTE), a $0.00 Fried Specialties dish is never
+        # given a dish price — even one whose own rules are missing or kept
+        # somewhere this check cannot see. "Prices on modifier rules" = some
+        # live $0.00 dish (any dish, in a dish group or not) has priced rules
+        # that hold its price (a By Itself, or a required choice) — the same
+        # test action5 makes on the live raw.
+        if self._restaurant_absolute():
+            for group, dish, _zh, prices in dishes:
+                if not _is_fried_specialty_group(group):
+                    continue
+                for v, p in prices.items():
+                    if abs(p) > 0.001 or (dish, v) in seen:
+                        continue
+                    out.append((group, dish, v, 'fried_specialty', None,
+                                'Fried Specialties dish at $0.00 in a restaurant that prices dishes '
+                                'on modifier rules (ABSOLUTE) — never given a dish price', ''))
+                    seen.add((dish, v))
+        return out
+
+    def _holds_price(self, rules) -> bool:
+        """Priced rules hold a $0.00 dish's price when a By Itself is among
+        them, or they price a REQUIRED choice (the customer must pick one — its
+        rule price is the dish's price). An optional add-on ("Sauce / With
+        +$1.00") is only an upcharge. Same test as action5."""
+        return any(_is_by_itself(x['mod']) or (x.get('mg') and x['mg'] in self.r.mg_required)
+                   for x in rules)
+
+    def _restaurant_absolute(self) -> bool:
+        """Some live $0.00 dish price has priced rules that hold it for that
+        size (_holds_price: a By Itself, or a required choice) — dish-level, or
+        group-level on one of the dish's groups."""
+        groups_of = defaultdict(set)
+        for g, ds in self.r.group_dishes.items():
+            for d in ds:
+                groups_of[d].add(g)
+        anchors = [x for x in self.r.mr_rules if x['price'] > 0.001 and self._holds_price([x])]
+        ganchors = [x for x in getattr(self.r, 'mr_group_rules', [])
+                    if x['price'] > 0.001 and self._holds_price([x])]
+        for dish, prices in self.r.dish_prices.items():
+            for v, p in prices.items():
+                if abs(p) > 0.001:
+                    continue
+                if any(x['dish'] == dish and x['variant'] in ('', v) for x in anchors) or \
+                        any(x['group'] in groups_of[dish] and x['variant'] in ('', v) for x in ganchors):
+                    return True
+        return False
+
+    _SIDE_WORDS = re.compile(r'\b(fries|rice|lo mein|chow mein|mei fun|mai fun|noodles?|pancit|side)\b')
+
+    def _get_side_rule_dishes(self, dishes) -> List[Tuple[str, str, int, str]]:
+        """[(group, dish, n_priced_rules, sample)] — Menu Preview dishes priced
+        with side-combo rules (a "Plain | w. Fries | w. Fried Rice" table): a
+        priced By Itself rule, or a priced side (fries / rice / lo mein / chow
+        mein / mei fun / noodles) — dish-level, or group-level on one of the
+        dish's groups. An add-on ("Spicy +$1.50", a sushi topping) is not a
+        side table."""
+        def side_like(rules):
+            # a priced By Itself, or a priced SIDE ("w. French Fries", "Pork
+            # Fried Rice", "Lo Mein") — not an add-on such as "Make it Spicy" or
+            # a sushi topping (Egg, Masago: real ER87669)
+            return any(_is_by_itself(x['mod']) or (x['mod'] and self._SIDE_WORDS.search(x['mod'].lower()))
+                       for x in rules)
+
+        by_dish = defaultdict(list)
+        for x in self.r.mr_rules:
+            if x['price'] > 0.001:
+                by_dish[x['dish']].append(x)
+        by_group = defaultdict(list)
+        for x in getattr(self.r, 'mr_group_rules', []):
+            if x['price'] > 0.001:
+                by_group[x['group']].append(x)
+        out, seen = [], set()
+        for group, dish, _zh, _prices in dishes:
+            if dish in seen:
+                continue
+            rules = by_dish.get(dish, [])
+            if not side_like(rules):
+                rules = next((by_group[g] for g in self.r.group_dishes
+                              if dish in self.r.group_dishes[g] and side_like(by_group.get(g, []))), [])
+            if rules:
+                seen.add(dish)
+                sample = ', '.join(sorted({x['mod'] for x in rules if x['mod']})[:4])
+                out.append((group, dish, len(rules), sample))
+        return out
+
     def generate(self, output_path: str) -> dict:
         """Generate the Excel 2a file. Returns summary stats."""
         wb = Workbook()
@@ -630,6 +869,27 @@ class Excel2aGenerator:
                     ws_price.cell(row=row, column=4 + vi, value=_fmt(prices[v]))
             row += 1
 
+        # ── System Codes tab: each size's dish code, row-aligned with price ──
+        ws_codes = wb.create_sheet('System Codes')
+        for ci, h in enumerate(p_headers, 1):
+            cell = ws_codes.cell(row=1, column=ci, value=h)
+            cell.fill = HEADER_FILL
+            cell.font = HEADER_FONT
+        row, current_group = 2, None
+        for group, name, zh, _prices in dishes:
+            if group != current_group:
+                ws_codes.cell(row=row, column=1, value=group)
+                row += 1
+                current_group = group
+            ws_codes.cell(row=row, column=1, value=group)
+            ws_codes.cell(row=row, column=2, value=name)
+            ws_codes.cell(row=row, column=3, value=zh)
+            for vi, v in enumerate(output_variants):
+                code = self.r.dish_codes.get(name, {}).get(v)
+                if code:
+                    ws_codes.cell(row=row, column=4 + vi, value=str(code)).number_format = '@'
+            row += 1
+
         # ── Modifier tab ──────────────────────────────────────────
         ws_mod = wb.create_sheet('modifier')
         m_headers = ['Dish Group', 'Modifier Group', 'Modifier Name:Primary',
@@ -652,6 +912,21 @@ class Excel2aGenerator:
                         ws_mod.cell(row=row, column=5 + vi, value=_fmt(mr['prices'][v]))
             row += 1
 
+        # ── absolute_pricing tab (v4.4) ───────────────────────────
+        # $0.00 dish cells whose price lives on modifiers. action2 never writes
+        # a paper price onto them, price_inference never infers one (G11).
+        ws_abs = wb.create_sheet('absolute_pricing')
+        abs_cells = self._get_absolute_cells(dishes)
+        for ci, h in enumerate(['Dish Group', 'Dish Name', 'Variant', 'Source',
+                                'By Itself Rule', 'Evidence', 'Modifier Group'], 1):
+            cell = ws_abs.cell(row=1, column=ci, value=h)
+            cell.fill = HEADER_FILL
+            cell.font = HEADER_FONT
+        for ri, (group, name, v, source, by_itself, evidence, mg) in enumerate(abs_cells, 2):
+            for ci, val in enumerate([group, name, v, source, _fmt(by_itself), evidence, mg], 1):
+                if val:
+                    ws_abs.cell(row=ri, column=ci, value=val)
+
         # ── Column widths ─────────────────────────────────────────
         _width_sheets = [ws_price, ws_mod]
         for sheet in _width_sheets:
@@ -660,6 +935,21 @@ class Excel2aGenerator:
             sheet.column_dimensions['C'].width = 20
             for i in range(4, 4 + len(output_variants) + 1):
                 sheet.column_dimensions[get_column_letter(i)].width = 12
+        for col, w in zip('ABCDEFG', (22, 38, 12, 16, 14, 70, 26)):
+            ws_abs.column_dimensions[col].width = w
+
+        # ── side_rules tab — dishes priced with side-combo rules ───
+        ws_sr = wb.create_sheet('side_rules')
+        side_dishes = self._get_side_rule_dishes(dishes)
+        for ci, h in enumerate(['Dish Group', 'Dish Name', 'Priced Rules', 'Modifiers'], 1):
+            cell = ws_sr.cell(row=1, column=ci, value=h)
+            cell.fill = HEADER_FILL
+            cell.font = HEADER_FONT
+        for ri, (group, name, n, sample) in enumerate(side_dishes, 2):
+            for ci, val in enumerate([group, name, n, sample], 1):
+                ws_sr.cell(row=ri, column=ci, value=val)
+        for col, w in zip('ABCD', (22, 38, 12, 60)):
+            ws_sr.column_dimensions[col].width = w
 
         wb.save(output_path)
         wb.close()
@@ -670,6 +960,8 @@ class Excel2aGenerator:
             'price_groups': len(set(d[0] for d in dishes)),
             'modifier_data_rows': data_mod_rows,
             'modifier_sections': len([r for r in mod_rows if r['is_sep']]),
+            'absolute_cells': abs_cells,
+            'side_rule_dishes': len(side_dishes),
         }
 
 
@@ -715,6 +1007,12 @@ def main():
     print(f"\n  Modifier tab:")
     print(f"    Data rows:   {stats['modifier_data_rows']}")
     print(f"    Sections:    {stats['modifier_sections']}")
+    abs_cells = stats['absolute_cells']
+    print(f"\n  absolute_pricing tab ($0.00 dish, price lives on modifiers — never "
+          f"overwritten from paper, G11): {len(abs_cells)}")
+    for group, name, v, source, _bi, evidence, _mg in abs_cells:
+        print(f"    {name} [{v}] — {evidence}")
+    print(f"  side_rules tab (dishes with priced side-combo rules): {stats['side_rule_dishes']}")
 
     # Warnings
     excluded_dupes = [name for name, count in reader.dish_root_counts.items()
