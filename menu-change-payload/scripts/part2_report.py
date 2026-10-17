@@ -88,8 +88,9 @@ def _request_lines(a5, req):
                    + (f" — only \"{u.get('struck_text','')}\" struck" if u.get('partial') else '')
                    for u in (req.get("make_unavailable") or {}).get("dishes", [])]
     notes_blk = req.get("notes_for_wonka") or {}
-    notes = [f"    - Questionnaire row {n.get('row')} [{n.get('question_id') or n.get('dish') or '—'}]: "
-             f"{n.get('note','')}" for n in notes_blk.get("notes", [])]
+    notes = [f"    - {n.get('tab') or 'Questionnaire'} row {n.get('row')} "
+             f"[{n.get('question_id') or n.get('dish') or '—'}]: {n.get('note','')}"
+             for n in notes_blk.get("notes", [])]
     return removed, unavailable, notes, notes_blk.get("skipped_reason")
 
 
@@ -126,8 +127,12 @@ def _entry_lines(a5, mr=None):
                 f"{'code' if c.get('what') == 'code' else 'price'} to remove"
                 + (" (Dish Code tab)" if c.get('what') == 'code' else '')
                 for c in (a5.get("removed") or {}).get("x_on_empty_cell_ignored", [])]
-    ignored += [f"    - Modifier Rule {_rule_label(t)}: {t.get('value','')!r} — {t.get('why','')}"
+    ignored += [f"    - {t.get('tab') or 'Modifier Rule'} {_rule_label(t)}: {t.get('value','')!r} — {t.get('why','')}"
                 for t in (mr or {}).get("ignored_input", [])]
+    # the same rule edited differently on the Modifier Rule and Fried Specialty tabs
+    conflicts += [f"    - Modifier Rule / Fried Specialty: {_rule_label(t)} — {t.get('modifier_rule_tab','')} on "
+                  f"Modifier Rule, {t.get('fried_specialty_tab','')} on Fried Specialty — not applied"
+                  for t in (mr or {}).get("tab_conflicts", [])]
     return added, ignored, conflicts, codes, drift_new, len(dup.get("resolved_from_edited_copy", []))
 
 

@@ -116,3 +116,11 @@ Changed:
 Unchanged in this batch: specialist_requests, crop_section, ocr_sanity_check,
   price_queue_gate, hook, setup.sh, cuisine modules, ocr-prompt.md.
 See ../CHANGELOG.md.
+
+v4.5 AMENDMENT (Fried Specialty / Modifier Rule tabs, 2026-10-16) — deliberate
+maintainer edit. Changed: scripts/modifier_rule_pricing.py (the Fried Specialty
+pattern found from the system alone; both tabs built with no or a partial paper
+table; the Fried Specialty tab rebuilt as FULL PRICE / PRICE DIFFERENCE /
+ABSOLUTE PRICE tables + Notes → Wonka; Questionnaire P-FS; apply reads the
+tables and reports tab conflicts), scripts/specialist_requests.py (the tab's
+notes), scripts/part2_report.py, ../menu-change-workflow-part1.md / part2.md.

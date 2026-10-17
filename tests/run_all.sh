@@ -16,4 +16,5 @@ fail=0
 "$PY" edits/check_edits.py "$B" || fail=1
 "$PY" audit/check_audit.py "$B" || fail=1
 "$PY" codes/check_codes.py "$B" || fail=1
+"$PY" fried_specialty/check_fried_specialty.py "$B" || fail=1
 if [ $fail = 0 ]; then echo "ALL CHECKS OK"; else echo "CHECKS FAILED"; exit 1; fi

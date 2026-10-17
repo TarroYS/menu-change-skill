@@ -1,5 +1,76 @@
 # Changelog
 
+## v4.5 — Fried Specialty / Modifier Rule tabs (2026-10-16)
+
+The maintainer's request, with two decisions:
+- the specialist types into the **difference** table (and an absolute table for absolute dishes), not the full-price
+  one;
+- only restaurants that price the sides **per dish** get the new tabs.
+
+**Both tabs whenever Fried Specialty dishes are priced per dish on their sides.**
+- compare finds the pattern from the system alone: dishes of a "Fried Specialt…" dish group whose own rules price
+  the items of a "Select…" modifier group (Select Rice: By Itself, French Fries, Pork Fried Rice …).
+- The Modifier Rule and Fried Specialty tabs are built when the paper prints:
+  - no Fried Specialty table (every price stays today's unless the specialist types a new one);
+  - only some of the dishes (every dish is listed, printed or not — also one on "Order", not "Specialty").
+- 44 restaurants in the real reports price this way; China Village (9 dishes, absolute) is one.
+- Restaurants that price Select Rice once for every dish (on the item itself — Modifier Summary: R85325, R83807,
+  ER87669) are unchanged.
+- Part 1 now runs compare every time; it says "Nothing to do" when there is nothing.
+
+**The Fried Specialty tab, rebuilt.** One row per dish and size, one column per side (Select Rice order):
+- **FULL PRICE** — the paper menu, for reference; grey = not printed (today's price).
+- **PRICE DIFFERENCE** — the dishes priced by difference.
+  - Type the side price minus Plain: plain numbers, no + sign (a + is accepted).
+  - Plain = the dish's Dish Item price, linked (edit it there).
+- **ABSOLUTE PRICE** — the absolute dishes. Plain = the By Itself rule; each side its full price.
+- **NOTES → WONKA** — a column on every row, and a box under the tables, for instructions or formulas.
+- Then how the paper was read (mappings, propagation, callback flags), as before.
+
+Grey cells = that size has no rule for that side. Same colours as the Modifier Rule tab: blue / pink / green from
+Part 1, orange = an edit, red = not applied. Questionnaire **P-FS** lists the dishes the paper does not print, to ask
+the client.
+
+**Part 2 reads the tables.**
+- Each cell is one rule. An edit (≠ its hidden value) is written, and beats an untouched Part 1 value.
+- The same rule edited differently on the Modifier Rule tab and the Fried Specialty tab is not applied; it is
+  reported (`tab_conflicts`, part2_report).
+- Refused and reported: not a price; x; a misplaced decimal point; a value in a grey cell; a typed-over Plain of a
+  difference-priced dish.
+- Rows are found by a hidden key, so a sorted table is safe.
+- The tab's notes go to Wonka with the Questionnaire notes (specialist_requests → part2_summary.json →
+  part2_report). part2.md: a price note or formula is carried out by editing the tables and re-running Part 2.
+
+**Independent review (same day): 10 problems found, all fixed.**
+- **High — an unprinted dish's side prices could change while P-FS said "today's".** The price-twin rule (as in
+  v4.3) copies the printed dishes' same side change to an unprinted dish. Such cells are now purple (not printed —
+  confirm), and P-FS names those dishes as filled. Part 2 still writes them unless the specialist changes them.
+- A value refused on the Fried Specialty tab (not a price, x, misplaced decimal) holds its rule, like the same input
+  on the Modifier Rule tab. Before, Part 1's untouched change was still written.
+- The Plain of an absolute size binds to its priced By Itself rule, not the first alias in the system ($0 No Rice).
+- A blank row inside a table no longer ends it; edits and notes below it were lost.
+- With the Modifier Rule tab deleted, the Fried Specialty tables are still applied (they were ignored).
+- The colours stay right after a quick sort: each rule looks its row's hidden values up by dish and size.
+- A value typed over a difference row's Plain (a link to Dish Item) shows red, as Part 2 refuses it.
+- compare refuses to rebuild tabs that already hold the specialist's edits or notes (`--rebuild` to force). A re-run
+  used to wipe them silently.
+- No false DRIFT warning when the paper has no side table.
+- An optional add-on group called "Select …" is not a side choice. A side choice holds a plain option (By Itself /
+  No Rice) or is a required pick.
+- Smaller: P-FS names the dishes' own groups; a size with no priced side is left out; a rule for every size of a
+  multi-size dish shows no single full price.
+
+**Checked.**
+- New suite `tests/fried_specialty` (30 checks):
+  - scenario A, plus a blank row and a deleted Modifier Rule tab;
+  - scenario B with edits, refusals, a sort (values and colours), a conflict, notes and the re-run guard;
+  - the twin fill;
+  - a By-Itself-only dish;
+  - the shared-price restaurant unchanged.
+- Every check fails when its piece is reverted (34 single reverts).
+- The whole suite passes.
+- China Village with its paper and without its side table: both tabs, P-FS, unedited Part 2 writes 0 cells.
+
 ## v4.4 (cont. 4) — dish codes, Party Tray per dish group, the maintainer's answers (2026-10-05)
 
 **Dish codes are now part of the menu change** (maintainer's decisions DC1–DC5, HANDOFF §5c).

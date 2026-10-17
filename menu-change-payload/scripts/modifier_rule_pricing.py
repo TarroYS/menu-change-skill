@@ -178,6 +178,8 @@ OUT_HEADERS = {
 
 # Sentinel that marks compare's appended block in the Fried Specialty tab.
 FS_SENTINEL = 'PRICE DIFFERENCE (column price minus Plain)'
+# its heading under the editable tables of the new Fried Specialty tab
+FS_READ_TITLE = 'HOW THE PAPER WAS READ — each paper row, the system dish and size it matched, its difference / total'
 MRV_TAB = 'Modifier Rule'
 FS_DRIFT_NOTE = ("⚠ Built by compare — the report had no Fried Specialty tab although this OCR JSON "
                  "has a multi-column table, so action2 / action3 ran on a different OCR JSON. Re-run "
@@ -447,6 +449,105 @@ def _check_g11(A):
     return _check_g11_core(A['mr_data'], A['dish_item_prices'], A.get('model'), A.get('dish_groups'))
 
 
+def _modifier_group_members(raw_gsheet_path):
+    """({modifier group: [items, in tab order]}, {modifier group: (min, max)
+    selections, None when the tab does not say}) from the raw's modifier_group tab."""
+    wb = load_workbook(raw_gsheet_path, read_only=True)
+    out = defaultdict(list)
+    sel = {}
+    if 'modifier_group' in wb.sheetnames:
+        rows = list(wb['modifier_group'].iter_rows(values_only=True))
+        h = [str(c).strip() if c else '' for c in rows[2]] if len(rows) > 2 else []
+        if 'modifier_group' in h and 'modifier_item' in h:
+            gi, ii = h.index('modifier_group'), h.index('modifier_item')
+            mi_ = h.index('min_number_of_selections') if 'min_number_of_selections' in h else None
+            ma_ = h.index('max_number_of_selections') if 'max_number_of_selections' in h else None
+
+            def _n(r, ci):
+                p = _parse(r[ci]) if ci is not None and ci < len(r) else None
+                return int(p) if p is not None else None
+            g = ''
+            for r in rows[3:]:
+                if r and gi < len(r) and r[gi]:
+                    g = str(r[gi]).strip()
+                it = str(r[ii]).strip() if r and ii < len(r) and r[ii] else ''
+                if g and not it and (mi_ is not None or ma_ is not None) and g not in sel:
+                    sel[g] = (_n(r, mi_), _n(r, ma_))       # the group's own row
+                if g and it and it not in out[g]:
+                    out[g].append(it)
+    wb.close()
+    return out, sel
+
+
+def _is_fried_specialty_group(g):
+    return bool(g) and 'fried special' in str(g).lower()
+
+
+def _fs_pattern(raw_gsheet_path, mr_data, dish_item_prices, dish_groups=None):
+    """The Fried Specialty pricing pattern (maintainer, 2026-10-16): dishes of a
+    "Fried Specialties" dish group whose own modifier_rule rows price the items
+    of a "Select …" modifier group (Select Rice: By Itself, French Fries, Pork
+    Fried Rice …) — DELTA (the dish carries the plain price, a rule the
+    difference) or ABSOLUTE (dish $0.00, By Itself the plain, a rule the full
+    price). Found from the system alone, so the Modifier Rule and Fried Specialty
+    tabs are built even when the paper prints no Fried Specialty table, or only
+    some of the dishes. Restaurants that price Select Rice once for every dish
+    (on modifier_item — Modifier Summary) have no per-dish prices: no pattern.
+    Returns {'dishes', 'side_items' (column order), 'cells' {(dish, variant): model}}."""
+    dish_groups = dish_groups if dish_groups is not None else _load_dish_groups(raw_gsheet_path)
+    fs_dishes = {d for d, gs in dish_groups.items() if any(_is_fried_specialty_group(g) for g in gs)}
+    members, sel = _modifier_group_members(raw_gsheet_path)
+
+    def _side_choice(g):
+        """A side choice (Select Rice) — not an add-on group that happens to be
+        called "Select …": it offers a plain option (By Itself / No Rice …), or
+        is a required pick (at least one / exactly one). A group the tab says
+        nothing about counts."""
+        if any(_is_by_itself(it) for it in members[g]):
+            return True
+        lo, hi = sel.get(g, (None, None))
+        if lo is None and hi is None:
+            return g not in sel
+        return (lo is not None and lo >= 1) or hi == 1
+
+    def _c(row, ci):
+        return str(row[ci]).strip() if len(row) > ci and row[ci] is not None else ''
+    priced = defaultdict(set)                  # modifier item -> {(dish, variant)} priced per dish
+    positive = set()                           # (dish, variant, item) priced above $0.00
+    for row in mr_data:
+        dish = _c(row, DISH_COL)
+        p = _parse(row[PRICE_COL]) if len(row) > PRICE_COL else None
+        if dish in fs_dishes and _c(row, MOD_COL) and p is not None:
+            priced[_c(row, MOD_COL)].add((dish, _c(row, VARIANT_COL)))
+            if p > 0.001:
+                positive.add((dish, _c(row, VARIANT_COL), _c(row, MOD_COL)))
+    side_groups = [g for g, items in members.items()
+                   if g.lower().startswith('select') and _side_choice(g) and any(it in priced for it in items)]
+    if not side_groups:
+        side_groups = [g for g, items in members.items()
+                       if _side_choice(g) and sum(it in priced for it in items) >= 2]
+    side_items = []
+    for g in side_groups:
+        for it in members[g]:
+            if it in priced and it not in side_items:
+                side_items.append(it)
+    cells = {}
+    models = _cell_models(mr_data, dish_item_prices)
+    for it in side_items:
+        for key in priced[it]:
+            if key in cells:
+                continue
+            if key in models:
+                cells[key] = models[key][0]
+            else:                                # every side rule $0.00 so far
+                dp = _dish_price(dish_item_prices, *key)
+                cells[key] = MODEL_DELTA if dp is not None and dp > 0.001 else MODEL_ABSOLUTE
+    # a pattern needs a real price: a dish whose side rules are all $0.00 prices nothing
+    real = {(d, v) for d, v, it in positive if it in side_items}
+    cells = {k: m for k, m in cells.items() if k in real}
+    return {'dishes': fs_dishes, 'side_items': side_items, 'side_groups': side_groups, 'cells': cells}
+
+
 def _normalize(name: str) -> str:
     s = str(name).lower().strip()
     s = re.sub(r'\s*\([^)]*\)\s*', ' ', s)
@@ -705,7 +806,13 @@ def _analyze(ocr_json_path, raw_gsheet_path):
     ocr_not_prices = _numeric_prices(ocr)
 
     sections = _side_sections(ocr)
-    if not sections:
+    # Pricing model per (dish, variant), from the raw, before any arithmetic.
+    _mr_data_pre, _dish_item_prices = _load_raw(raw_gsheet_path)
+    dish_groups = _load_dish_groups(raw_gsheet_path)
+    # Fried Specialty dishes priced per dish on Select Rice items: analysed even
+    # when the paper prints no multi-column table, or only some of them
+    fs = _fs_pattern(raw_gsheet_path, _mr_data_pre, _dish_item_prices, dish_groups)
+    if not sections and not fs['cells']:
         return None
     side_columns = []                       # union, paper order (for the mapping)
     for sec in sections:
@@ -713,8 +820,6 @@ def _analyze(ocr_json_path, raw_gsheet_path):
             if c not in side_columns:
                 side_columns.append(c)
 
-    # Pricing model per (dish, variant), from the raw, before any arithmetic.
-    _mr_data_pre, _dish_item_prices = _load_raw(raw_gsheet_path)
     model, model_evidence = _detect_pricing_model(_mr_data_pre, _dish_item_prices)
     cells = _cell_models(_mr_data_pre, _dish_item_prices)
 
@@ -808,17 +913,16 @@ def _analyze(ocr_json_path, raw_gsheet_path):
     #   (a) its dish_item has a 'Specialty' variant anywhere in modifier_rule,
     #   (b) its dish_item was matched from a paper multi-column table,
     #   (c) its dish_group is a Fried Specialty group (group-level rules that
-    #       carry no dish_item are kept too — selected per spec).
+    #       carry no dish_item are kept too — selected per spec),
+    #   (d) its dish is a Fried Specialty dish priced per dish on Select Rice
+    #       items (_fs_pattern) — printed on the paper or not.
     specialty_dishes = set()
     for row in mr_data:
         d = str(row[DISH_COL]).strip() if len(row) > DISH_COL and row[DISH_COL] else ''
         v = str(row[VARIANT_COL]).strip() if len(row) > VARIANT_COL and row[VARIANT_COL] else ''
         if d and v == 'Specialty':
             specialty_dishes.add(d)
-    selected_dishes = matched_dishes | specialty_dishes
-
-    def _is_fried_specialty_group(g):
-        return bool(g) and 'fried special' in g.lower()
+    selected_dishes = matched_dishes | specialty_dishes | {d for d, _v in fs['cells']}
 
     mr_dish_rows = defaultdict(list)
     all_modifier_items = set()
@@ -850,7 +954,6 @@ def _analyze(ocr_json_path, raw_gsheet_path):
     notes = list(ocr_not_prices) + [f"NOT A PRICE in the OCR JSON side prices: {x} — not compared"
                                     for x in not_a_price]
     hold = set()   # ((dish, variant), modifier) left at the current price
-    dish_groups = _load_dish_groups(raw_gsheet_path)
     # dish group → the modifier items its enabled, priced GROUP-level rules price
     # (a rule that only attaches a modifier group prices nothing itself)
     group_side_mods = defaultdict(set)
@@ -1141,7 +1244,8 @@ def _analyze(ocr_json_path, raw_gsheet_path):
                 labels={k: _label(*k) for k in models},
                 flags=flags, notes=notes, cells=cells,
                 model=model, model_evidence=model_evidence,
-                mr_data=_mr_data_pre, dish_item_prices=_dish_item_prices)
+                mr_data=_mr_data_pre, dish_item_prices=_dish_item_prices,
+                fs=fs, rule_variants=rule_variants, by_itself_mods=by_itself_mods)
 
 
 def _default_crop_path():
@@ -1223,6 +1327,27 @@ def _dish_price_expr(cands, prefer_group):
         if ref:
             expr = f'IF({cell}<>{ref},{cell},{expr})'
     return expr
+
+
+def _invalid_rule_formulas(c, base):
+    """Conditional-format formulas (red text) for a typed rule price that apply
+    ignores — the same verdicts as _rule_entry + _misplaced: text that is not a
+    number, characters a price never has, 1000 or more, 5× / a fifth of the live
+    price `base` (a misplaced decimal point). Negatives are fine on rules.
+    c / base: the first cell of the range and its live-price cell."""
+    val = f'VALUE(SUBSTITUTE(TRIM({c}),"$",""))'
+    has = lambda ch: f'ISNUMBER(SEARCH("{ch}",{c}))'
+    ratio = lambda x: (f'{base}<>0,ROUND({x},2)<>0,'          # rounded first, like apply
+                       f'OR(ROUND(ABS({x}),2)>=5*ABS({base}),ROUND(ABS({x}),2)*5<=ABS({base}))')
+    out = (f'AND(ISTEXT({c}),TRIM({c}&"")<>"",ISERROR({val}))',
+           f'AND(ISTEXT({c}),OR({has(",")},{has("%")},{has(":")},{has("(")},{has("e")},{has("/")}))',
+           f'IFERROR(AND(ISNUMBER({c}),ROUND(ABS({c}),2)>=1000),FALSE)',
+           f'AND(ISTEXT({c}),TRIM({c}&"")<>"",IFERROR(ROUND(ABS({val}),2)>=1000,FALSE))',
+           f'IFERROR(AND(ISNUMBER({c}),ISNUMBER({base}),{ratio(c)}),FALSE)',
+           f'IFERROR(AND(ISTEXT({c}),ISNUMBER({base}),{ratio(val)}),FALSE)')
+    for f in out:
+        assert len(f) < 255, (len(f), f)
+    return out
 
 
 def _render_mrv_tab(ws, A, img_path=None):
@@ -1403,18 +1528,7 @@ def _render_mrv_tab(ws, A, img_path=None):
         # has, 1000 or more, 5× / a fifth of the live price (a misplaced decimal
         # point). Negatives are fine on rules. Same rules as _rule_entry.
         # 5× / a fifth against the LIVE rule price at Part 1 (hidden _ref_live)
-        c, base = f'${pL}{data_start}', f'${get_column_letter(VAL_LIVE_COL)}{data_start}'
-        val = f'VALUE(SUBSTITUTE(TRIM({c}),"$",""))'
-        has = lambda ch: f'ISNUMBER(SEARCH("{ch}",{c}))'
-        ratio = lambda x: (f'{base}<>0,ROUND({x},2)<>0,'          # rounded first, like apply
-                           f'OR(ROUND(ABS({x}),2)>=5*ABS({base}),ROUND(ABS({x}),2)*5<=ABS({base}))')
-        for f in (f'AND(ISTEXT({c}),TRIM({c}&"")<>"",ISERROR({val}))',
-                  f'AND(ISTEXT({c}),OR({has(",")},{has("%")},{has(":")},{has("(")},{has("e")},{has("/")}))',
-                  f'IFERROR(AND(ISNUMBER({c}),ROUND(ABS({c}),2)>=1000),FALSE)',
-                  f'AND(ISTEXT({c}),TRIM({c}&"")<>"",IFERROR(ROUND(ABS({val}),2)>=1000,FALSE))',
-                  f'IFERROR(AND(ISNUMBER({c}),ISNUMBER({base}),{ratio(c)}),FALSE)',
-                  f'IFERROR(AND(ISTEXT({c}),ISNUMBER({base}),{ratio(val)}),FALSE)'):
-            assert len(f) < 255, (len(f), f)
+        for f in _invalid_rule_formulas(f'${pL}{data_start}', f'${get_column_letter(VAL_LIVE_COL)}{data_start}'):
             ws.conditional_formatting.add(prng, FormulaRule(formula=[f], fill=INVALID_FILL, font=INVALID_FONT,
                                                             stopIfTrue=True))
         # (a conditional-format formula is stored WITHOUT a leading '=' — Excel
@@ -1487,21 +1601,30 @@ def _point_pabs_rows(wb, A):
     return pointed
 
 
-def _append_fried_specialty(ws, A):
-    """Append delta + propagation below Action-3's own section (idempotent)."""
-    # Strip any prior compare append (rows at/after the sentinel).
-    sentinel_row = None
-    for row in ws.iter_rows(min_col=1, max_col=1):
-        if row[0].value == FS_SENTINEL:
-            sentinel_row = row[0].row
-            break
-    if sentinel_row:
-        ws.delete_rows(sentinel_row, ws.max_row - sentinel_row + 1)
-    # a re-run starts where the previous block started (never one row lower)
-    r = sentinel_row if sentinel_row else ws.max_row + 2
+def _append_fried_specialty(ws, A, heading=FS_SENTINEL, start=None):
+    """Append delta + propagation below Action-3's own section (idempotent).
+    start: the row to write at (the new Fried Specialty tab, built from
+    scratch), else below action3's block, replacing compare's previous append."""
+    if start is None:
+        # Strip any prior compare append (rows at/after the sentinel).
+        sentinel_row = None
+        for row in ws.iter_rows(min_col=1, max_col=1):
+            if row[0].value == FS_SENTINEL:
+                sentinel_row = row[0].row
+                break
+        if sentinel_row:
+            ws.delete_rows(sentinel_row, ws.max_row - sentinel_row + 1)
+        # a re-run starts where the previous block started (never one row lower)
+        r = sentinel_row if sentinel_row else ws.max_row + 2
+    else:
+        r = start
     # Section 2: Price difference — one block per multi-column paper section
-    ws.cell(row=r, column=1, value=FS_SENTINEL).font = Font(bold=True, size=12)
+    ws.cell(row=r, column=1, value=heading).font = Font(bold=True, size=12)
     r += 1
+    if not A['sections']:
+        ws.cell(row=r, column=1, value='The paper menu prints no multi-column (side) table — every price above '
+                                       'is today\'s, from the system.').font = Font(italic=True, color='666666')
+        r += 2
     model = A.get('model')
     if model == MODEL_ABSOLUTE:
         note = ('ABSOLUTE model — side rules store the FULL total, so the values below are the '
@@ -1552,33 +1675,34 @@ def _append_fried_specialty(ws, A):
     # Column → modifier + dish-name mappings.
     # Both blocks are anchored at column B (col index 2), not A: column A is too
     # narrow to read the longer column headers / dish names comfortably.
-    ws.cell(row=r, column=2, value='COLUMN → MODIFIER MAPPING').font = Font(bold=True, size=11)
-    r += 1
-    for col, mods in A['col_to_mods'].items():
-        ws.cell(row=r, column=2, value=col)
-        ws.cell(row=r, column=3, value='→')
-        ws.cell(row=r, column=4, value=', '.join(mods) if mods else '⚠ NO MATCH')
+    if A['sections']:
+        ws.cell(row=r, column=2, value='COLUMN → MODIFIER MAPPING').font = Font(bold=True, size=11)
         r += 1
-    r += 1
-    # Dish name mapping (moved here from the former Delta Analysis tab).
-    # List EVERY OCR dish from every multi-column section — not just matched
-    # ones. Matched dishes show the resolved system name; a dish captured in OCR
-    # that has no modifier_rule counterpart (i.e. it was never in the wsheet
-    # modifier_rule tab) is flagged '⚠ NO MATCH' so the specialist sees it
-    # instead of it silently vanishing from the table.
-    ws.cell(row=r, column=2, value='DISH NAME MAPPING (OCR → System)').font = Font(bold=True, size=11)
-    r += 1
-    _seen_dn = set()
-    for item in (it for sec in A['sections'] for it in sec['items']):
-        o = item['name']
-        if o in _seen_dn:
-            continue
-        _seen_dn.add(o)
-        ws.cell(row=r, column=2, value=o)
-        ws.cell(row=r, column=3, value='→')
-        ws.cell(row=r, column=4, value=A['dish_map'].get(o, '⚠ NO MATCH'))
+        for col, mods in A['col_to_mods'].items():
+            ws.cell(row=r, column=2, value=col)
+            ws.cell(row=r, column=3, value='→')
+            ws.cell(row=r, column=4, value=', '.join(mods) if mods else '⚠ NO MATCH')
+            r += 1
         r += 1
-    r += 1
+        # Dish name mapping (moved here from the former Delta Analysis tab).
+        # List EVERY OCR dish from every multi-column section — not just matched
+        # ones. Matched dishes show the resolved system name; a dish captured in OCR
+        # that has no modifier_rule counterpart (i.e. it was never in the wsheet
+        # modifier_rule tab) is flagged '⚠ NO MATCH' so the specialist sees it
+        # instead of it silently vanishing from the table.
+        ws.cell(row=r, column=2, value='DISH NAME MAPPING (OCR → System)').font = Font(bold=True, size=11)
+        r += 1
+        _seen_dn = set()
+        for item in (it for sec in A['sections'] for it in sec['items']):
+            o = item['name']
+            if o in _seen_dn:
+                continue
+            _seen_dn.add(o)
+            ws.cell(row=r, column=2, value=o)
+            ws.cell(row=r, column=3, value='→')
+            ws.cell(row=r, column=4, value=A['dish_map'].get(o, '⚠ NO MATCH'))
+            r += 1
+        r += 1
     # Section 3: propagation detail
     ws.cell(row=r, column=1, value='PROPAGATION DETAIL (per dish price-group)').font = Font(bold=True, size=12)
     r += 1
@@ -1625,6 +1749,411 @@ def _append_fried_specialty(ws, A):
         for nt in A['notes']:
             ws.cell(row=r, column=1, value=nt)
             r += 1
+
+
+# ── Fried Specialty tab: the editable price tables (maintainer, 2026-10-16) ──
+# Every dish priced with a side choice (the Select Rice pattern), one row per
+# (dish, size), one column per side. FULL PRICE = the paper menu (grey: not
+# printed — today's price). The specialist types new prices into PRICE
+# DIFFERENCE (difference-priced sizes: what the rule stores, the side price
+# minus Plain) and ABSOLUTE PRICE (absolute sizes: By Itself = the plain dish,
+# each side its full price); `apply` reads them next to the Modifier Rule tab.
+# Notes → Wonka: a column on every row and a box under the tables.
+FS_TAB = 'Fried Specialty'
+FS_TITLE = 'FRIED SPECIALTY — every dish priced with a side (Select Rice), one row per dish and size'
+FS_FULL_TITLE = 'FULL PRICE — from the paper menu'
+FS_DIFF_TITLE = 'PRICE DIFFERENCE — side price minus Plain'
+FS_ABS_TITLE = 'ABSOLUTE PRICE — the full price the customer pays'
+FS_NOTES_TITLE = 'NOTES → WONKA'
+FS_NOTES_COL = 'Notes → Wonka'
+FS_NOTE_ROWS = 8
+FS_PLAIN = 'Plain'
+FS_NO_RULE = 'no rule'          # hidden baseline: the dish has no rule for this side (nothing to write)
+FS_NO_PRICE = 'no price'        # the rule has no price (a gate) — never written (G1)
+FS_SEVERAL = 'several rules'    # several live rules share the key — edit them in wsheet
+FS_MARKERS = (FS_NO_RULE, FS_NO_PRICE, FS_SEVERAL)
+# headings that end a table (and the notes box) when the tab is read back
+FS_HEADINGS = (FS_TITLE, FS_FULL_TITLE, FS_DIFF_TITLE, FS_ABS_TITLE, FS_NOTES_TITLE, FS_SENTINEL,
+               'HOW THE PAPER WAS READ')
+NO_RULE_FILL = PatternFill('solid', fgColor='EDEDED')
+NOTE_BOX_FILL = PatternFill('solid', fgColor='FFFDE7')
+INFERRED_FILL = PatternFill('solid', fgColor='E4DFEC')   # not printed: filled from printed dishes (confirm)
+TODAY_FONT = Font(color='808080', italic=True)
+
+
+def _fs_table(A):
+    """Rows and side columns of the Fried Specialty price tables. A row = a
+    (dish, size) with at least one rule on a side item. items = the side
+    modifier items, in Select Rice order then paper-mapped ones (By Itself is
+    the Plain column, never a side)."""
+    items = [it for it in A['fs']['side_items'] if not _is_by_itself(it)]
+    for col in A['side_columns']:
+        for mod in A['col_to_mods'].get(col, []):
+            if mod not in items and not _is_by_itself(mod):
+                items.append(mod)
+    rules = defaultdict(dict)                  # (dish, variant) -> modifier -> live price (None: no price)
+    count = defaultdict(int)
+    for dish, rows in A['mr_dish_rows'].items():
+        if dish.startswith('[group] '):
+            continue
+        for _ri, row in rows:
+            v = str(row[VARIANT_COL]).strip() if len(row) > VARIANT_COL and row[VARIANT_COL] else ''
+            mod = str(row[MOD_COL]).strip() if len(row) > MOD_COL and row[MOD_COL] else ''
+            if mod:
+                rules[(dish, v)][mod] = _parse(row[PRICE_COL]) if len(row) > PRICE_COL else None
+                count[(dish, v, mod)] += 1
+    out = []
+    for key in sorted(rules, key=lambda k: (k[0], _variant_sort_key(k[1]))):
+        if not any(it in rules[key] for it in items):
+            continue
+        groups = sorted(A['dish_groups'].get(key[0], ()), key=lambda g: (not _is_fried_specialty_group(g), g))
+        model = A['models'].get(key, MODEL_DELTA)
+        several = {m for m in rules[key] if count[(key[0], key[1], m)] > 1}
+        # the plain dish of an ABSOLUTE size: its priced By Itself-type rule (the
+        # highest, as the model detection reads it), the literal "By Itself" first
+        aliases = [m for m in rules[key] if _is_by_itself(m)]
+        anchor = max(aliases, key=lambda m: ((rules[key][m] or 0) > 0.001, _normalize(m) == 'by itself',
+                                             rules[key][m] or 0)) if aliases else None
+        editable = [m for m in items + ([anchor] if model == MODEL_ABSOLUTE and anchor else [])
+                    if m in rules[key] and m not in several and rules[key][m] is not None]
+        if not editable:
+            continue                              # nothing on this size has a price to change
+        out.append({'key': key, 'group': groups[0] if groups else '', 'model': model, 'rules': rules[key],
+                    'several': several, 'anchor': anchor})
+    return {'items': items, 'rows': out}
+
+
+def _render_fs_tab(ws, A, drift=False):
+    """The Fried Specialty tab (see FS_TITLE): FULL PRICE, PRICE DIFFERENCE,
+    ABSOLUTE PRICE, the Notes → Wonka box, then how the paper was read.
+    Returns {'rows', 'delta', 'absolute'} counts."""
+    tbl = _fs_table(A)
+    items, rows = tbl['items'], tbl['rows']
+    C_GROUP, C_DISH, C_SIZE, C_PLAIN, C_ITEM0 = 1, 2, 3, 4, 5
+    C_NOTES = C_ITEM0 + len(items)
+    H0 = C_NOTES + 2                           # hidden block, after a blank spacer column
+    C_KEY, C_ANCHOR = H0, H0 + 1
+    names = [FS_PLAIN] + items
+    C_REF = {nm: H0 + 2 + 2 * i for i, nm in enumerate(names)}
+    C_LIVE = {nm: H0 + 3 + 2 * i for i, nm in enumerate(names)}
+    # the colour rules read each row's hidden values through these lookups (by
+    # the row's own dish|size key), so a sort of the visible block keeps them right
+    H1 = max(C_LIVE.values()) + 1
+    C_CFREF = {nm: H1 + 2 * i for i, nm in enumerate(names)}
+    C_CFLIVE = {nm: H1 + 1 + 2 * i for i, nm in enumerate(names)}
+    item_col = {it: C_ITEM0 + i for i, it in enumerate(items)}
+    di_cells = _dish_item_cells(getattr(ws, 'parent', None))
+    hidden_font = Font(color='808080', size=8)
+    r = 1
+    if drift:
+        ws.cell(row=r, column=1, value=FS_DRIFT_NOTE).font = Font(bold=True, color='C00000')
+        r += 1
+    ws.cell(row=r, column=1, value=FS_TITLE).font = Font(bold=True, size=13)
+    r += 1
+    n_delta = sum(1 for x in rows if x['model'] != MODEL_ABSOLUTE)
+    n_abs = len(rows) - n_delta
+    ws.cell(row=r, column=1, value=(
+        f"Priced by difference (Plain on the dish, each side's extra on its rule): {n_delta} dish size(s); "
+        f"absolute (dish $0.00, By Itself = the plain dish, each side its full price): {n_abs}.")
+    ).font = Font(italic=True, color='7F6000')
+    r += 1
+    for line in ("Type new prices in PRICE DIFFERENCE and ABSOLUTE PRICE: plain numbers (1.20 — no + sign). "
+                 "Part 2 writes them to the system. FULL PRICE is the paper menu (grey = not printed: today's price).",
+                 "Blue = up, pink = down (as printed), purple = not printed — filled from the printed dishes' same "
+                 "change (confirm on the callback), green = the paper confirms today's price, orange = your edit, red "
+                 "text = not applied (not a price, a misplaced decimal point, or a grey cell: that size has no rule "
+                 "for that side).",
+                 "The Modifier Rule tab lists the same rules one per row — edit either; the same rule edited "
+                 "differently on both is not applied (it is reported). Notes → Wonka: the last column, or the box "
+                 "under the tables — Part 2 hands every note to Wonka."):
+        ws.cell(row=r, column=1, value=line).font = Font(italic=True, color='666666')
+        r += 1
+    r += 1
+
+    def header(row_, plain_label, last_label):
+        labels = {C_GROUP: 'Dish Group', C_DISH: 'Dish', C_SIZE: 'Size', C_PLAIN: plain_label}
+        labels.update({c: it for it, c in item_col.items()})
+        labels[C_NOTES] = last_label
+        for c, lab in labels.items():
+            cell = ws.cell(row=row_, column=c, value=lab)
+            cell.font, cell.fill = HEADER_FONT, HEADER_FILL
+
+    def ident(row_, x):
+        ws.cell(row=row_, column=C_GROUP, value=x['group'])
+        ws.cell(row=row_, column=C_DISH, value=x['key'][0])
+        ws.cell(row=row_, column=C_SIZE, value=x['key'][1])
+
+    def today_plain(x):
+        if x['model'] == MODEL_ABSOLUTE:
+            return x['rules'].get(x['anchor']) if x['anchor'] else None
+        if not x['key'][1]:                    # a rule for every size: one plain only if one size
+            sizes = [p for (d, _v), p in A['dish_item_prices'].items() if d == x['key'][0] and p and p > 0.001]
+            return sizes[0] if len(sizes) == 1 else None
+        return _dish_price(A['dish_item_prices'], *x['key'])
+
+    # ── 1. FULL PRICE — the paper menu ──
+    ws.cell(row=r, column=1, value=f'{FS_FULL_TITLE} (grey = not printed: today\'s price) — for '
+                                   f'reference, not read by Part 2').font = Font(bold=True, size=12)
+    r += 1
+    header(r, FS_PLAIN, 'Priced as')
+    r += 1
+    for x in rows:
+        key = x['key']
+        ident(r, x)
+        printed_plain = A['sys_plain'].get(key)
+        tp = today_plain(x)
+        c = ws.cell(row=r, column=C_PLAIN, value=round(printed_plain if printed_plain is not None else tp, 2)
+                    if (printed_plain is not None or tp is not None) else None)
+        c.number_format = '0.00'
+        if printed_plain is None:
+            c.font = TODAY_FONT
+        for it, ci in item_col.items():
+            c = ws.cell(row=r, column=ci)
+            if it not in x['rules']:
+                c.fill = NO_RULE_FILL
+                continue
+            src = A['price_sources'].get(key, {}).get(it)
+            printed = A['printed_total'].get(key, {}).get(it) if src == 'PAPER MENU' else None
+            old = x['rules'][it]
+            if printed is not None:
+                c.value = round(printed, 2)
+            elif old is not None:
+                full = old if x['model'] == MODEL_ABSOLUTE else (
+                    old + tp if tp is not None else None)
+                c.value = round(full, 2) if full is not None else None
+                c.font = TODAY_FONT
+            c.number_format = '0.00'
+        ws.cell(row=r, column=C_NOTES, value='absolute' if x['model'] == MODEL_ABSOLUTE else 'difference')
+        r += 1
+    r += 1
+
+    # ── 2. / 3. the editable tables ──
+    def table(title, model_rows, absolute):
+        nonlocal r
+        if not model_rows:
+            return
+        ws.cell(row=r, column=1, value=title + ' — type new prices here (Part 2 reads them)'
+                ).font = Font(bold=True, size=12, color='C00000')
+        r += 1
+        header(r, 'Plain (By Itself)' if absolute else 'Plain (Dish Item price)', FS_NOTES_COL)
+        for c, lab in ((C_KEY, '_ref_key'), (C_ANCHOR, '_ref_anchor')):
+            ws.cell(row=r, column=c, value=lab).font = hidden_font
+        for nm in names:
+            ws.cell(row=r, column=C_REF[nm], value=f'_ref:{nm}').font = hidden_font
+            ws.cell(row=r, column=C_LIVE[nm], value=f'_live:{nm}').font = hidden_font
+        r += 1
+        first = r
+        for x in model_rows:
+            key = x['key']
+            ident(r, x)
+            ws.cell(row=r, column=C_KEY, value=f'{key[0]}|{key[1]}').font = hidden_font
+            if absolute and x['anchor']:
+                ws.cell(row=r, column=C_ANCHOR, value=x['anchor']).font = hidden_font
+            cols = [(FS_PLAIN, C_PLAIN, x['anchor'])] if absolute else []
+            cols += [(it, ci, it) for it, ci in item_col.items()]
+            for nm, ci, mod in cols:
+                c = ws.cell(row=r, column=ci)
+                c.number_format = '0.00'
+                ref = ws.cell(row=r, column=C_REF[nm])
+                ref.font = hidden_font
+                if not mod or mod not in x['rules']:
+                    c.fill, ref.value = NO_RULE_FILL, FS_NO_RULE
+                    continue
+                if mod in x['several']:
+                    c.fill, ref.value = NO_RULE_FILL, FS_SEVERAL
+                    continue
+                old = x['rules'][mod]
+                if old is None:
+                    c.fill, ref.value = NO_RULE_FILL, FS_NO_PRICE
+                    continue
+                new = A['final_prices'].get(key, {}).get(mod, old)
+                src = A['price_sources'].get(key, {}).get(mod, '')
+                c.value = round(new, 2)
+                if abs(new - old) > 0.001:
+                    c.fill = (BLUE_FILL if new > old else PINK_FILL) if src == 'PAPER MENU' else INFERRED_FILL
+                elif src and src != 'NO DATA':
+                    c.fill = GREEN_FILL
+                ref.value = round(new, 2)
+                ref.number_format = '0.00'
+                live = ws.cell(row=r, column=C_LIVE[nm], value=round(old, 2))
+                live.font, live.number_format = hidden_font, '0.00'
+            if not absolute:
+                # the plain of a difference-priced dish is its Dish Item price — shown
+                # live (edit it there); the hidden copy says what Part 1 saw
+                tp = today_plain(x)
+                cands = di_cells.get(key)
+                if not cands and not key[1]:
+                    sizes = [k for k in di_cells if k[0] == key[0]]
+                    cands = di_cells[sizes[0]] if len(sizes) == 1 else None
+                src_ = _dish_price_expr(cands, x['group']) if cands else None
+                c = ws.cell(row=r, column=C_PLAIN, value=(
+                    f'=IF(TRIM(({src_})&"")="","",IFERROR(VALUE(SUBSTITUTE(({src_})&"","$","")),""))'
+                    if src_ else (f'={round(tp, 2)}' if tp is not None else None)))
+                c.number_format, c.font = '0.00', Font(color='595959')
+                if tp is not None:
+                    ws.cell(row=r, column=C_REF[FS_PLAIN], value=round(tp, 2)).font = hidden_font
+            r += 1
+        last = r - 1
+        key_l = get_column_letter(C_KEY)
+        dish_l, size_l = get_column_letter(C_DISH), get_column_letter(C_SIZE)
+        for rr in range(first, last + 1):
+            for nm in names:
+                for dst, srcc in ((C_CFREF[nm], C_REF[nm]), (C_CFLIVE[nm], C_LIVE[nm])):
+                    sl = get_column_letter(srcc)
+                    ws.cell(row=rr, column=dst, value=(
+                        f'=IFERROR(INDEX(${sl}${first}:${sl}${last},MATCH(${dish_l}{rr}&"|"&${size_l}{rr},'
+                        f'${key_l}${first}:${key_l}${last},0)),"")')).font = hidden_font
+        if not absolute:
+            pl = get_column_letter(C_PLAIN)
+            ws.conditional_formatting.add(f'{pl}{first}:{pl}{last}', FormulaRule(
+                formula=[f'AND(TRIM(${pl}{first}&"")<>"",NOT(ISFORMULA(${pl}{first})))'],
+                fill=INVALID_FILL, font=INVALID_FONT, stopIfTrue=True))
+        # sheet colours = what Part 2 does with each typed cell
+        for nm in ([FS_PLAIN] if absolute else []) + items:
+            col = get_column_letter(C_PLAIN if nm == FS_PLAIN else item_col[nm])
+            ref_l, live_l = get_column_letter(C_CFREF[nm]), get_column_letter(C_CFLIVE[nm])
+            rng = f'{col}{first}:{col}{last}'
+            c, ref, base = f'${col}{first}', f'${ref_l}{first}', f'${live_l}{first}'
+            ws.conditional_formatting.add(rng, FormulaRule(
+                formula=[f'AND(TRIM({c}&"")<>"",ISTEXT({ref}))'], fill=INVALID_FILL, font=INVALID_FONT,
+                stopIfTrue=True))
+            for f in _invalid_rule_formulas(c, base):
+                ws.conditional_formatting.add(rng, FormulaRule(formula=[f], fill=INVALID_FILL, font=INVALID_FONT,
+                                                               stopIfTrue=True))
+            ws.conditional_formatting.add(rng, FormulaRule(formula=[
+                f'IFERROR(AND(ISNUMBER({ref}),VALUE(SUBSTITUTE({c}&"","$",""))<>{ref}),FALSE)'],
+                fill=ORANGE_FILL))
+        r += 1
+
+    table(FS_DIFF_TITLE, [x for x in rows if x['model'] != MODEL_ABSOLUTE], absolute=False)
+    table(FS_ABS_TITLE, [x for x in rows if x['model'] == MODEL_ABSOLUTE], absolute=True)
+
+    # ── 4. Notes → Wonka box ──
+    ws.cell(row=r, column=1, value=(f'{FS_NOTES_TITLE} — instructions or formulas for this tab (e.g. "every '
+                                    f'Lo Mein side = Fried Rice side + 1.00"); Part 2 hands each one to Wonka')
+            ).font = Font(bold=True, size=12)
+    r += 1
+    for _ in range(FS_NOTE_ROWS):
+        ws.merge_cells(start_row=r, start_column=2, end_row=r, end_column=max(C_NOTES, 4))
+        ws.cell(row=r, column=2).fill = NOTE_BOX_FILL
+        r += 1
+    r += 1
+
+    for c in range(H0, max(C_CFLIVE.values()) + 1):
+        ws.column_dimensions[get_column_letter(c)].hidden = True
+    ws.column_dimensions['A'].width = 18
+    ws.column_dimensions['B'].width = 30
+    ws.column_dimensions['C'].width = 12
+    ws.column_dimensions['D'].width = 14
+    for ci in item_col.values():
+        ws.column_dimensions[get_column_letter(ci)].width = 13
+    ws.column_dimensions[get_column_letter(C_NOTES)].width = 40
+    ws.sheet_properties.tabColor = RED_TAB
+    # ── 5. how the paper was read: mappings, propagation, callback flags ──
+    _append_fried_specialty(ws, A, heading=FS_READ_TITLE, start=r)
+    return {'rows': len(rows), 'delta': n_delta, 'absolute': n_abs}
+
+
+def _report_work(report_path):
+    """What the specialist already put into compare's tabs — edits or typed
+    cells on the Modifier Rule / Fried Specialty tabs, Notes → Wonka on the
+    Fried Specialty tab or on the P-FS row. Re-running compare would replace
+    them, so compare refuses (unless --rebuild)."""
+    found = []
+    try:
+        mr = _read_mrv(report_path)
+    except Exception:
+        mr = None
+    if mr:
+        n = sum(1 for _k, _p, kd in mr[0] if kd == 'edit') + len(mr[2])
+        if n:
+            found.append(f'{n} edited cell(s) on the Modifier Rule tab')
+    fs = _read_fs(report_path)
+    if fs:
+        n = sum(1 for _k, _p, kd in fs[0] if kd == 'edit') + len(fs[1])
+        if n:
+            found.append(f'{n} edited cell(s) on the Fried Specialty tab')
+    wb = load_workbook(report_path, read_only=True)
+    notes = 0
+    if FS_TAB in wb.sheetnames:
+        rows = [list(r) for r in wb[FS_TAB].iter_rows(values_only=True)]
+        in_box, note_col = False, None
+        for r in rows:
+            a = str(r[0]).strip() if r and r[0] is not None else ''
+            if a.startswith((FS_DIFF_TITLE, FS_ABS_TITLE, FS_FULL_TITLE, FS_READ_TITLE)):
+                in_box, note_col = False, None
+                continue
+            if a.startswith(FS_NOTES_TITLE):
+                in_box, note_col = True, None
+                continue
+            if note_col is None and FS_NOTES_COL in [str(v).strip() if v is not None else '' for v in r]:
+                note_col = [str(v).strip() if v is not None else '' for v in r].index(FS_NOTES_COL)
+                continue
+            if in_box:
+                notes += any(str(v).strip() for v in r if v is not None)
+            elif note_col is not None and note_col < len(r) and str(r[note_col] or '').strip():
+                notes += 1
+    if 'Questionnaire' in wb.sheetnames:
+        q = [list(r) for r in wb['Questionnaire'].iter_rows(values_only=True)]
+        hdr = [str(v).strip().lower() if v is not None else '' for v in q[0]] if q else []
+        nc = next((i for i, h in enumerate(hdr) if h.startswith('notes')), None)
+        if nc is not None:
+            notes += sum(1 for r in q[1:] if r and str(r[0] or '').startswith(PFS_ID)
+                         and nc < len(r) and str(r[nc] or '').strip())
+    wb.close()
+    if notes:
+        found.append(f'{notes} Notes → Wonka on the Fried Specialty tab / P-FS row')
+    return found
+
+
+PFS_ID = 'P-FS'
+
+
+def _write_pfs(wb, A):
+    """Questionnaire P-FS: the Fried Specialty dishes the paper does not print
+    (no table at all, or only some of them) — their prices are today's, so ask
+    the client for them. Replaces compare's previous P-FS rows (idempotent)."""
+    if 'Questionnaire' not in wb.sheetnames:
+        return 0, 0
+    ws = wb['Questionnaire']
+    for r in range(ws.max_row, 1, -1):
+        if str(ws.cell(row=r, column=1).value or '').startswith(PFS_ID):
+            ws.delete_rows(r)
+    rows = _fs_table(A)['rows']
+    not_printed, filled, groups = [], [], []
+    for x in rows:
+        key = x['key']
+        srcs = A['price_sources'].get(key, {})
+        if key in A['sys_plain'] or any(s == 'PAPER MENU' for s in srcs.values()):
+            continue
+        label = f"{key[0]} [{key[1]}]" if key[1] else key[0]
+        not_printed.append(label)
+        if x['group'] and x['group'] not in groups:
+            groups.append(x['group'])
+        if any(abs(A['final_prices'].get(key, {}).get(m, p) - p) > 0.001
+               for m, p in x['rules'].items() if p is not None and srcs.get(m) not in (None, '', 'NO DATA')):
+            filled.append(label)
+    if not not_printed:
+        return 0, 0
+    r = ws.max_row + 2
+    ws.cell(row=r, column=1, value=f'{PFS_ID} — FRIED SPECIALTY PRICES NOT ON THE PAPER (ASK ON THE CALLBACK)'
+            ).font = Font(bold=True, size=11, color='C00000')
+    r += 1
+    cut = lambda xs: ', '.join(xs[:25]) + (f' (+{len(xs) - 25} more)' if len(xs) > 25 else '')
+    ws.cell(row=r, column=1, value=f'{PFS_ID}-1')
+    ws.cell(row=r, column=2, value='P-FS (not on the paper)')
+    ws.cell(row=r, column=3, value=', '.join(groups))
+    ws.cell(row=r, column=4, value=f'{len(not_printed)} of {len(rows)} dish size(s)')
+    ws.cell(row=r, column=8, value=(
+        f"{'The paper prints no Fried Specialty table' if not A['sections'] else 'Not on the paper'}: "
+        f"{cut(not_printed)}. "
+        + (f"Side prices filled from the printed dishes' same change (purple on the Fried Specialty tab — Part 2 "
+           f"writes them unless you change them): {cut(filled)}. The rest are today's prices (grey on FULL "
+           f"PRICE). " if filled else "Their prices are today's (grey on the Fried Specialty tab's FULL PRICE "
+                                      "table). ")
+        + "Ask the client for the plain price and each side, and type them into the Fried Specialty tab's "
+          "PRICE DIFFERENCE / ABSOLUTE PRICE tables.")).font = Font(bold=True, color='C00000')
+    return len(not_printed), len(filled)
 
 
 def _reorder_tabs(wb):
@@ -1722,10 +2251,17 @@ def cmd_compare(args):
             sys.exit(1)
         _print_cell_models(A['cells'])
     if A is None:
-        print("No multi-column pricing data found. Nothing to do.")
+        print("No multi-column pricing on the paper and no Fried Specialty dish priced per dish on its "
+              "sides (Select Rice) in the system. Nothing to do.")
         sys.exit(0)
 
     n_paper = len({e['name'] for sec in A['sections'] for e in sec['entries']})
+    fs_cells = A['fs']['cells']
+    if fs_cells:
+        n_abs = sum(1 for m in fs_cells.values() if m == MODEL_ABSOLUTE)
+        print(f"\nFried Specialty dishes priced per dish on their sides ({', '.join(A['fs']['side_groups'])}): "
+              f"{len({d for d, _v in fs_cells})} dish(es), {len(fs_cells)} size(s) — "
+              f"{len(fs_cells) - n_abs} by difference, {n_abs} absolute")
     print(f"\nMulti-column sections: {len(A['sections'])}")
     for sec in A['sections']:
         print(f"  '{sec['name']}': {len(sec['items'])} items with side pricing; "
@@ -1747,6 +2283,12 @@ def cmd_compare(args):
         img_path = _img_arg or _default_crop_path()
 
     if args.report:
+        work = _report_work(args.report)
+        if work and not getattr(args, 'rebuild', False):
+            print(f"\n!! This report already holds the specialist's work in compare's tabs — "
+                  f"{'; '.join(work)}. Re-running compare would replace it. Nothing written. Run Part 1 on "
+                  f"a fresh copy of the report, or pass --rebuild to replace it anyway.")
+            sys.exit(1)
         wb = load_workbook(args.report)
         # Modifier Rule (own red tab — see _apply_tab_styling)
         if MRV_TAB in wb.sheetnames:
@@ -1759,12 +2301,25 @@ def cmd_compare(args):
         for t in (DELTA_TAB, PROP_TAB):
             if t in wb.sheetnames:
                 del wb[t]
+        fs_counts = None
+        if _fs_table(A)['rows']:
+            # Dishes priced with a side: the Fried Specialty tab is rebuilt with
+            # the editable price tables (paper menu or not). Drift: the paper has
+            # a multi-column table but action3 made no tab (another OCR JSON).
+            had = FS_TAB in wb.sheetnames
+            drift = bool(A['sections']) and (not had or wb[FS_TAB]['A1'].value == FS_DRIFT_NOTE)
+            if had:
+                del wb[FS_TAB]
+            fs_counts = _render_fs_tab(wb.create_sheet(FS_TAB), A, drift=drift)
+            fs_counts['not_printed'], fs_counts['filled'] = _write_pfs(wb, A)
+            if drift:
+                print(f"\n!! DRIFT: {FS_DRIFT_NOTE}")
         # Fold delta + mappings + propagation into Fried Specialty (below Action-3 section)
-        if 'Fried Specialty' in wb.sheetnames:
+        elif 'Fried Specialty' in wb.sheetnames:
             _append_fried_specialty(wb['Fried Specialty'], A)
             if wb['Fried Specialty']['A1'].value == FS_DRIFT_NOTE:
                 print(f"\n!! DRIFT (still): {FS_DRIFT_NOTE}")
-        else:
+        elif A['sections']:
             # The OCR JSON has a multi-column table but the report has no Fried
             # Specialty tab: action2 / action3 ran on a different OCR JSON.
             # Build the tab from this analysis and say so — never silently.
@@ -1781,6 +2336,15 @@ def cmd_compare(args):
         wb.save(out)
         wb.close()
         print(f"\n  Folded into report: {out}")
+        if fs_counts:
+            print(f"  Fried Specialty tab: {fs_counts['rows']} dish size(s) in editable tables — "
+                  f"{fs_counts['delta']} PRICE DIFFERENCE, {fs_counts['absolute']} ABSOLUTE PRICE")
+            if fs_counts.get('not_printed'):
+                print(f"  Not on the paper: {fs_counts['not_printed']} dish size(s) — asked in the Questionnaire "
+                      f"(P-FS); " + (f"{fs_counts['filled']} of them got side prices from the printed dishes' same "
+                                     f"change (purple — written unless the specialist changes them), the rest stay "
+                                     f"today's" if fs_counts.get('filled') else
+                                     "their prices stay today's unless the specialist types new ones"))
     else:
         out = args.output or 'modifier_rule_review.xlsx'
         wb = Workbook()
@@ -1949,12 +2513,15 @@ def _read_mrv(report_path):
                                 f'{_fmt(ref_)} — {MISPLACED_RATIO}× or a fifth) — not applied; type the right price, or '
                                 f'confirm in Notes → Wonka'))
                 continue
+            # kind: 'edit' = the specialist's edit (or a tab too old to tell),
+            # 'part1' = compare's change left untouched, '' = untouched
             if not has_baseline or base is None or abs(price - base) > 0.001:
-                instr = True                 # edited (or a tab too old to tell)
+                instr = 'edit'
             elif has_live:
-                instr = was is not None and abs(base - was) > 0.001    # compare changed it
+                instr = 'part1' if was is not None and abs(base - was) > 0.001 else ''
             else:                            # older tab: compare's blue / pink fill
-                instr = fill in (BLUE_FILL.fgColor.rgb[-6:].upper(), PINK_FILL.fgColor.rgb[-6:].upper())
+                instr = ('part1' if fill in (BLUE_FILL.fgColor.rgb[-6:].upper(), PINK_FILL.fgColor.rgb[-6:].upper())
+                         else '')
             entries.append((key, price, instr))
         return entries, gi is not None, ignored
 
@@ -1979,8 +2546,127 @@ def _read_mrv(report_path):
         if kind != 'price':
             ignored.append(((grp, dish, variant, mod), r[PRICE_COL], 'not a valid price'))
             continue
-        entries.append(((grp, dish, variant, mod), price, True))
+        entries.append(((grp, dish, variant, mod), price, 'edit'))
     return entries, True, ignored
+
+
+def _read_fs(report_path, has_group=True):
+    """Edits on the Fried Specialty tab's PRICE DIFFERENCE / ABSOLUTE PRICE
+    tables. Each cell is one dish-level modifier_rule row (dish, size, side);
+    the Plain of an ABSOLUTE row is its By Itself rule. Returns (entries,
+    ignored) — entries [(key, price, kind)], kind 'edit' (≠ the hidden
+    baseline), 'part1' (compare's change, untouched) or '' (untouched);
+    ignored [(key, typed, why, where)] — or None when the tab has no such tables.
+    Rows are matched to their hidden data by key (a sorted table is safe)."""
+    wb = load_workbook(report_path)
+    if FS_TAB not in wb.sheetnames:
+        wb.close()
+        return None
+    ws = wb[FS_TAB]
+    rows = [[c.value for c in row] for row in ws.iter_rows()]
+    pct = [['%' in str(c.number_format or '') for c in row] for row in ws.iter_rows()]
+    wb.close()
+    wbc = load_workbook(report_path, read_only=True, data_only=True)
+    cached = [list(r) for r in wbc[FS_TAB].iter_rows(values_only=True)]
+    wbc.close()
+    starts = [(i, str(r[0]).strip().startswith(FS_ABS_TITLE)) for i, r in enumerate(rows)
+              if r and isinstance(r[0], str) and str(r[0]).strip().startswith((FS_DIFF_TITLE, FS_ABS_TITLE))]
+    if not starts:
+        return None
+    entries, ignored = [], []
+
+    def key_of(dish, size, mod):
+        return ('', dish, size, mod) if has_group else (dish, size, mod)
+
+    for ti, absolute in starts:
+        hi = ti + 1
+        if hi >= len(rows):
+            continue
+        hdr = [str(c).strip() if c is not None else '' for c in rows[hi]]
+        col = {h: j for j, h in enumerate(hdr) if h}
+        if 'Dish' not in col or '_ref_key' not in col:
+            continue
+        plain_col = next((j for h, j in col.items() if h.startswith('Plain')), None)
+        hid_names = {h[len('_ref:'):] for h in col if h.startswith('_ref:')}
+        data = []
+        for ri in range(hi + 1, len(rows)):
+            r = rows[ri]
+            if r and isinstance(r[0], str) and r[0].strip().startswith(FS_HEADINGS):
+                break                                  # the next section of the tab
+            if r and any(v not in (None, '') for v in r):
+                data.append(ri)                        # a blank row inside a table is skipped
+        by_key = {str(rows[ri][col['_ref_key']]): rows[ri] for ri in data
+                  if col['_ref_key'] < len(rows[ri]) and rows[ri][col['_ref_key']] not in (None, '')}
+        for ri in data:
+            r = rows[ri]
+            dish = str(r[col['Dish']] or '').strip()
+            if not dish:
+                continue
+            size = str(r[col['Size']] or '').strip() if 'Size' in col and r[col['Size']] is not None else ''
+            where = f"Fried Specialty row {ri + 1}"
+            hid = by_key.get(f'{dish}|{size}')
+            if hid is None:
+                ignored.append((key_of(dish, size, ''), dish, 'this row is not one Part 1 made (dish or size '
+                                'renamed?) — nothing read from it', where))
+                continue
+            anchor = str(hid[col['_ref_anchor']] or '').strip() if '_ref_anchor' in col else ''
+            for nm in sorted(hid_names, key=lambda n: (n != FS_PLAIN, n)):
+                vis = plain_col if nm == FS_PLAIN else col.get(nm)
+                if vis is None or vis >= len(r):
+                    continue
+                v = r[vis]
+                ref = hid[col[f'_ref:{nm}']] if col[f'_ref:{nm}'] < len(hid) else None
+                live = hid[col[f'_live:{nm}']] if f'_live:{nm}' in col and col[f'_live:{nm}'] < len(hid) else None
+                if nm == FS_PLAIN and not absolute:
+                    # the Plain of a difference-priced dish is its Dish Item price (a
+                    # link, a formula): anything typed over it is not read (shown red)
+                    if v not in (None, '') and not (isinstance(v, str) and v.startswith('=')):
+                        ignored.append((key_of(dish, size, FS_PLAIN), v, 'the Plain of a difference-priced '
+                                        'dish is its Dish Item price — change it on the Dish Item tab', where))
+                    continue
+                mod = anchor if nm == FS_PLAIN else nm
+                if isinstance(v, str) and v.startswith('='):
+                    cv = cached[ri][vis] if ri < len(cached) and vis < len(cached[ri]) else None
+                    if cv is None:
+                        ignored.append((key_of(dish, size, mod), v, 'a formula with no saved result — open and '
+                                        'save the report in Excel / Google Sheets, or type the number', where))
+                        continue
+                    v = cv
+                kind, price = _rule_entry(v)
+                if kind == 'blank':
+                    continue
+                if isinstance(ref, str) and ref.strip() in FS_MARKERS:
+                    ignored.append((key_of(dish, size, mod or nm), v, {
+                        FS_NO_RULE: f'{dish} [{size or "every size"}] has no rule for {mod or nm} — nothing to '
+                                    f'write it to (ask Wonka in Notes → Wonka to add one)',
+                        FS_NO_PRICE: 'this rule has no price in the live menu (a disabled / gate rule) — a price '
+                                     'is never written into it (G1)',
+                        FS_SEVERAL: 'several live rules match this dish, size and side — edit them in wsheet',
+                    }[ref.strip()], where))
+                    continue
+                if kind == 'price' and ri < len(pct) and vis < len(pct[ri]) and pct[ri][vis]:
+                    kind = 'invalid'
+                if kind != 'price':
+                    ignored.append((key_of(dish, size, mod), v, 'x is not used on the Fried Specialty tab — type the '
+                                    'price, or ask Wonka to disable the rule' if kind == 'x' else
+                                    'not a valid price (letters, comma, %, 1000 or more)', where))
+                    continue
+                base, was = _parse(ref), _parse(live)
+                ref_ = was if was is not None else base
+                if (ref_ is not None and (base is None or abs(price - base) > 0.001 or abs(base - ref_) > 0.001)
+                        and _misplaced(price, ref_)):
+                    ignored.append((key_of(dish, size, mod), v, f'looks like a misplaced decimal point '
+                                    f'({_fmt(price)} vs the live {_fmt(ref_)} — {MISPLACED_RATIO}× or a fifth) — not '
+                                    f'applied; type the right price, or confirm in Notes → Wonka', where))
+                    continue
+                if base is None or abs(price - base) > 0.001:
+                    kind_ = 'edit'
+                elif was is not None and abs(base - was) > 0.001:
+                    kind_ = 'part1'
+                else:
+                    kind_ = ''
+                entries.append((key_of(dish, size, mod), price, kind_))
+    return entries, ignored
 
 
 def _key_label(key):
@@ -2031,13 +2717,65 @@ def cmd_apply(args):
             print(f"   - {_v}")
         print(f"!! DOUBLE-CHARGE ERROR (G11): {len(_g11)} violation(s) - refusing to apply.")
         sys.exit(1)
+    mr_present = read is not None
     if read is None:
-        print("No 'Modifier Rule' tab in the report. Nothing to apply.")
-        sys.exit(0)
+        if not _read_fs(args.report):
+            print("No 'Modifier Rule' tab in the report. Nothing to apply.")
+            sys.exit(0)
+        # the Modifier Rule tab was deleted, the Fried Specialty tables are still there
+        print("No 'Modifier Rule' tab in the report — applying the Fried Specialty tab's price tables.")
+        read = ([], True, [])
     entries, has_group, ignored = read
+    ignored = [(k, t, w, MRV_TAB) for k, t, w in ignored]
+    # The Fried Specialty tab's price tables hold the same dish-level rules as a
+    # grid (maintainer, 2026-10-16): a cell the specialist changed there counts
+    # like the same rule's row here. The specialist's edit beats an untouched
+    # Part 1 change; the same rule edited differently on both tabs is a
+    # conflict — not applied, reported.
+    tab_conflicts = []          # (key, Modifier Rule price, Fried Specialty price)
+    fs_read = _read_fs(args.report, has_group)
+    if fs_read:
+        fs_entries, fs_ignored = fs_read
+        ignored += [(k, t, w, where) for k, t, w, where in fs_ignored]
+        at = defaultdict(list)
+        for i, (k, _p, _kd) in enumerate(entries):
+            at[k].append(i)
+        drop = set()
+        # a cell refused here (not a price, x, misplaced decimal …) holds its rule
+        # like the same input on the Modifier Rule tab: Part 1's untouched value
+        # is not written either — only an edit made there still counts
+        for k, _t, _w, _where in fs_ignored:
+            for j in at.get(k, []):
+                if entries[j][2] != 'edit':
+                    drop.add(j)
+        for k, p, kd in fs_entries:
+            idx = at.get(k, [])
+            if not idx:
+                # its Modifier Rule cell was left blank / not a price: only an edit
+                # made here counts — an untouched Part 1 value never sneaks back in
+                # (no Modifier Rule tab at all: the tables are the only source)
+                if kd == 'edit' or not mr_present:
+                    entries.append((k, p, kd))
+                continue
+            if len(idx) > 1:
+                if kd == 'edit':                   # several tab rows share the key — the edit cannot be placed
+                    ignored.append((k, p, 'several Modifier Rule rows share this dish, size and side — edit '
+                                    'them on the Modifier Rule tab', FS_TAB))
+                continue
+            j = idx[0]
+            _k, mp, mkd = entries[j]
+            if kd == 'edit' and mkd == 'edit' and abs(p - mp) > 0.001:
+                tab_conflicts.append((k, mp, p))
+                drop.add(j)
+            elif kd == 'edit' and mkd != 'edit':
+                entries[j] = (k, p, 'edit')
+        entries = [e for i, e in enumerate(entries) if i not in drop]
     print(f"Approved out_unit_price rows: {len(entries)}")
-    for k, typed, why in ignored:
-        print(f"!! NOT A PRICE — ignored: {_key_label(k)} {str(typed)!r} — {why}")
+    for k, typed, why, where in ignored:
+        print(f"!! NOT A PRICE — ignored ({where}): {_key_label(k)} {str(typed)!r} — {why}")
+    for k, mp, fp in tab_conflicts:
+        print(f"!! CONFLICT: {_key_label(k)} edited to {_fmt(mp)} on the Modifier Rule tab and to {_fmt(fp)} "
+              f"on the Fried Specialty tab — NOT applied. Ask which is right.")
 
     def key_of(g, d, v, m):
         return (g, d, v, m) if has_group else (d, v, m)
@@ -2046,7 +2784,7 @@ def cmd_apply(args):
     tab_instr = defaultdict(bool)
     for key, price, instr in entries:
         tab_prices[key].append(price)
-        tab_instr[key] = tab_instr[key] or instr
+        tab_instr[key] = tab_instr[key] or bool(instr)
     # A report made before the dish_group column cannot identify a group-level
     # rule (no dish_item) — never guess which group it meant.
     unkeyed = [k for k in tab_prices if not has_group and not k[0]]
@@ -2186,7 +2924,9 @@ def cmd_apply(args):
             'total': len(not_reverted),
             'triples': [_as_dict(k) for k in not_reverted[:200]],
         },
-        'ignored_input': [dict(_as_dict(k), value=str(t), why=w) for k, t, w in ignored],
+        'ignored_input': [dict(_as_dict(k), value=str(t), why=w, tab=where) for k, t, w, where in ignored],
+        'tab_conflicts': [dict(_as_dict(k), modifier_rule_tab=_fmt(mp), fried_specialty_tab=_fmt(fp))
+                          for k, mp, fp in tab_conflicts],
         'held': [dict(_as_dict(k), old=_fmt(o), new=_fmt(n), why=w) for k, o, n, w in held],
         'no_live_price': [_as_dict(k) for k in no_live_price],
         'drift': {
@@ -2218,6 +2958,9 @@ def cmd_apply(args):
               f"/ gate rule); a price is never written into it (G1)")
     if ignored:
         print(f"  Not a price — ignored: {len(ignored)}")
+    if tab_conflicts:
+        print(f"  Edited differently on the Modifier Rule and Fried Specialty tabs (NOT applied): "
+              f"{len(tab_conflicts)}")
     print(f"  Drift warnings (NOT applied): {len(drift)}")
     if ambiguous or unkeyed:
         print(f"  Ambiguous / unkeyed rows (NOT applied): {len(ambiguous) + len(unkeyed)}")
@@ -2298,6 +3041,9 @@ def main():
                     help='PNG of the paper-menu multi-column pricing block to embed on '
                          'the Modifier Rule tab (default: crops/special_full.png if present; '
                          'produce one with crop_section.py). Use "" or "none" to disable.')
+    pc.add_argument('--rebuild', action='store_true',
+                    help='replace the Modifier Rule / Fried Specialty tabs even when the specialist has '
+                         'already edited them or written notes there (compare refuses otherwise)')
     pc.set_defaults(func=cmd_compare)
 
     pp = sub.add_parser('preflight',

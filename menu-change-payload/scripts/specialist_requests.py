@@ -19,6 +19,9 @@ to Wonka (part2.md §0b):
     an instruction for Wonka, listed with its row's context (ID, dish,
     prices, Details). Only a report that has the "Details" column is read —
     in an older report column H "Notes" holds the script's own text.
+  * Fried Specialty tab (2026-10-16): the Notes → Wonka column of its price
+    tables (one note per dish and size) and the NOTES → WONKA box under them
+    (instructions or formulas for the whole tab).
 
 Prices are NOT touched here: price edits (and x = remove a price) are applied
 by action5 / modifier_rule_pricing apply as usual.
@@ -114,6 +117,64 @@ def _notes(wb):
     return out, None
 
 
+FS_TAB = 'Fried Specialty'
+FS_TABLES = ('PRICE DIFFERENCE — ', 'ABSOLUTE PRICE — ')     # the editable tables (modifier_rule_pricing)
+FS_NOTES_BOX = 'NOTES → WONKA'
+FS_HEADINGS = ('HOW THE PAPER WAS READ', 'FULL PRICE — ', 'PRICE DIFFERENCE', 'ABSOLUTE PRICE — ',
+               'FRIED SPECIALTY — ', 'COLUMN → MODIFIER', 'DISH NAME MAPPING', 'PROPAGATION DETAIL')
+
+
+def _fs_notes(wb):
+    """Notes → Wonka on the Fried Specialty tab: the last column of its price
+    tables (one note per dish and size) and the notes box under them
+    (instructions or formulas for the whole tab)."""
+    if FS_TAB not in wb.sheetnames:
+        return []
+    ws = wb[FS_TAB]
+    rows = [[c.value for c in row] for row in ws.iter_rows()]
+    out = []
+    i = 0
+    while i < len(rows):
+        title = _text(rows[i][0]) if rows[i] else ''
+        if title.startswith(FS_TABLES) and i + 1 < len(rows):
+            hdr = [_text(v) for v in rows[i + 1]]
+            col = {h: j for j, h in enumerate(hdr) if h}
+            nc = next((j for h, j in col.items() if h.lower().startswith('notes')), None)
+            j = i + 2
+            # to the next section of the tab (a blank row inside the table is skipped)
+            while j < len(rows) and not (rows[j] and _text(rows[j][0]).startswith(FS_HEADINGS + (FS_NOTES_BOX,))):
+                r = rows[j]
+                if not (r and any(v not in (None, '') for v in r)):
+                    j += 1
+                    continue
+                note = _text(r[nc]) if nc is not None and nc < len(r) else ''
+                if note:
+                    dish, size = _text(r[col['Dish']]) if 'Dish' in col else '', \
+                        _text(r[col['Size']]) if 'Size' in col else ''
+                    out.append({'tab': FS_TAB, 'row': j + 1, 'question_id': '', 'category': 'Fried Specialty note',
+                                'dish_group': _text(r[col['Dish Group']]) if 'Dish Group' in col else '',
+                                'dish': f'{dish} [{size}]' if size else dish, 'current_price': None,
+                                'expected_price': None, 'menu_price': None,
+                                'details': title.split(' — ')[0].title() + ' table', 'note': note})
+                j += 1
+            i = j
+            continue
+        if title.startswith(FS_NOTES_BOX):
+            j = i + 1
+            # the box ends at the next section heading of the tab
+            while j < len(rows) and not (rows[j] and _text(rows[j][0]).startswith(FS_HEADINGS)):
+                note = ' '.join(_text(v) for v in rows[j] if _text(v))
+                if note:
+                    out.append({'tab': FS_TAB, 'row': j + 1, 'question_id': '', 'category': 'Fried Specialty note',
+                                'dish_group': '', 'dish': '', 'current_price': None, 'expected_price': None,
+                                'menu_price': None, 'details': 'notes box (the whole tab)', 'note': note})
+                j += 1
+            i = j
+            continue
+        i += 1
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -125,6 +186,7 @@ def main():
     wb = load_workbook(args.report, rich_text=True)
     unavailable = _unavailable(wb)
     notes, skipped = _notes(wb)
+    notes += _fs_notes(wb)
     wb.close()
 
     path = os.path.join(args.dir, 'part2_summary.json')
@@ -154,10 +216,10 @@ def main():
     if skipped:
         print(f'  Notes → Wonka: not read — {skipped}')
     else:
-        print(f'  Notes → Wonka (Questionnaire column I): {len(notes)}')
+        print(f'  Notes → Wonka (Questionnaire column I, Fried Specialty tab): {len(notes)}')
         for n in notes:
-            where = ' · '.join(x for x in (n['question_id'], n['dish']) if x)
-            print(f'    - row {n["row"]} [{where}]: "{n["note"]}"')
+            where = ' · '.join(x for x in (n['question_id'], n['dish'], n['details'] if n.get('tab') else '') if x)
+            print(f'    - {n.get("tab", "Questionnaire")} row {n["row"]} [{where}]: "{n["note"]}"')
     print('  The scripts apply none of these — Wonka carries them out (part2.md §0b).')
     print(f'  Summary JSON: {path}')
     print('=' * 60)

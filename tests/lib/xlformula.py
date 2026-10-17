@@ -1,6 +1,6 @@
 """A small Excel formula evaluator for the tests — the subset compare and action3
 write (IF, OR, AND, NOT, IFERROR, TRIM, VALUE, SUBSTITUTE, ABS, ROUND, MAX, MIN,
-LEN, CHAR, EXACT, ISNUMBER, ISTEXT, SEARCH, FIND, LEFT, LOWER; cell refs incl. 'Sheet'!$A$1 and ranges
+LEN, CHAR, EXACT, ISNUMBER, ISTEXT, ISFORMULA, SEARCH, FIND, LEFT, LOWER, INDEX, MATCH; cell refs incl. 'Sheet'!$A$1 and ranges
 $A1:$C1; & + - * comparisons), so a test can check what a spreadsheet would
 SHOW instead of matching formula text.
 
@@ -96,12 +96,13 @@ def _cmp(a, b, op):
 
 
 class _Range(list):
-    """The values of a cell range (only MAX / MIN take one)."""
+    """The values of a cell range (MAX / MIN / INDEX / MATCH take one)."""
 
 
 class _Parser:
-    def __init__(self, toks, getcell, getrange=None):
+    def __init__(self, toks, getcell, getrange=None, isformula=None):
         self.t, self.i, self.get, self.getrange = toks, 0, getcell, getrange
+        self.isformula = isformula
 
     def peek(self):
         return self.t[self.i] if self.i < len(self.t) else (None, None)
@@ -174,6 +175,11 @@ class _Parser:
             e = self.expr()
             self.take(')')
             return e
+        if kind == 'func' and val == 'ISFORMULA' and self.isformula is not None:
+            self.take('(')
+            _k, ref = self.take()                   # a cell reference: is it a formula?
+            self.take(')')
+            return lambda r=ref: self.isformula(r)
         if kind == 'func':
             self.take('(')
             args = []
@@ -305,6 +311,27 @@ def _func(name, args):
                 raise XLError('#VALUE!')
             return float(pos + 1)
         return f
+    if name == 'INDEX':                         # INDEX(column range, n); an empty cell reads 0
+        def f():
+            rng, n = args[0](), int(_num(args[1]()))
+            vals = list(rng) if isinstance(rng, _Range) else [rng]
+            if n < 1 or n > len(vals):
+                raise XLError('#REF!')
+            return 0.0 if vals[n - 1] is None else vals[n - 1]
+        return f
+    if name == 'MATCH':                         # MATCH(value, range, 0): exact, text case-insensitive
+        def f():
+            what, rng = args[0](), args[1]()
+            for i, v in enumerate(list(rng) if isinstance(rng, _Range) else [rng], 1):
+                if v is None:
+                    continue
+                if isinstance(what, str) and isinstance(v, str):
+                    if what.lower() == v.lower():
+                        return float(i)
+                elif not isinstance(what, str) and not isinstance(v, str) and _num(what) == _num(v):
+                    return float(i)
+            raise XLError('#N/A')
+        return f
     if name == 'LEFT':
         return lambda: _text(args[0]())[:int(_num(args[1]())) if len(args) > 1 else 1]
     raise ValueError(f'function {name} not supported')
@@ -351,7 +378,13 @@ def evaluate(wb, ws, formula, depth=0):
 
     if not (isinstance(formula, str) and formula.startswith('=')):
         return '' if formula is None else formula
-    p = _Parser(_tokens(formula[1:]), getcell, getrange)
+    def isformula(ref):
+        m = re.fullmatch(r"(?:'([^']+)'!|([A-Za-z_][\w ]*)!)?\$?([A-Z]{1,3})\$?([0-9]+)", ref)
+        sheet = wb[m.group(1) or m.group(2)] if (m.group(1) or m.group(2)) else ws
+        cell = sheet[f'{m.group(3)}{m.group(4)}']
+        return isinstance(cell.value, str) and cell.value.startswith('=') and cell.data_type == 'f'
+
+    p = _Parser(_tokens(formula[1:]), getcell, getrange, isformula)
     out = p.expr()()
     if p.i != len(p.t):
         raise ValueError(f'trailing tokens in {formula!r}')
