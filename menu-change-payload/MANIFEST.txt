@@ -22,3 +22,105 @@ The fidelity lock still applies at RUN time to these new bytes. Changed:
 Unchanged: action1, action4, action5, modifier_rule_pricing, bridge,
   crop_section, price_queue_gate, part2_report, hook, setup.sh.
 See ../CHANGELOG.md.
+
+v4.4 AMENDMENT (Fried Specialty / modifier_rule, issues #1-#6) — deliberate
+maintainer edit to locked scripts. The fidelity lock still applies at RUN time
+to these new bytes. Changed:
+  scripts/action1_raw_to_2a.py, scripts/action2_ocr_to_2b_0625v2.py,
+  scripts/action3_compare_and_merge.py, scripts/price_inference.py,
+  scripts/modifier_rule_pricing.py, scripts/action5_to_raw_gsheet.py,
+  scripts/part2_report.py, references/price-inference.md,
+  references/ocr-prompt.md (rule 5: sized rows keyed by size).
+Unchanged: action4, bridge, crop_section, ocr_sanity_check, price_queue_gate,
+  hook, setup.sh, cuisine modules.
+See ../CHANGELOG.md.
+
+v4.4 (cont.) AMENDMENT (the specialist's edit sheet + same-price inference
+rules, 2026-09-30) — deliberate maintainer edit to locked scripts. The
+fidelity lock still applies at RUN time to these new bytes. New:
+  scripts/specialist_requests.py (Part 2 step 0b: struck dish names +
+  Questionnaire Notes → Wonka → part2_summary.json; applies nothing).
+Changed:
+  scripts/action1_raw_to_2a.py, scripts/action2_ocr_to_2b_0625v2.py (the
+  'Modifier Group' column on absolute_pricing / Absolute Held, for P-ABS),
+  scripts/action3_compare_and_merge.py, scripts/price_inference.py,
+  scripts/modifier_rule_pricing.py, scripts/action4_apply_modifier_changes.py,
+  scripts/action5_to_raw_gsheet.py, scripts/wsheet_xlsx_bridge.py,
+  scripts/part2_report.py, references/price-inference.md.
+Unchanged in this batch: crop_section, ocr_sanity_check, price_queue_gate,
+  hook, setup.sh, cuisine modules, ocr-prompt.md.
+See ../CHANGELOG.md.
+
+v4.4 (cont. 2) AMENDMENT (new prices in empty cells, duplicate rows, Part 2
+writes only instructions, live Modifier Rule links, widened $0 guard,
+2026-09-30 evening) — deliberate maintainer edit to locked scripts. The
+fidelity lock still applies at RUN time to these new bytes. Changed:
+  scripts/action1_raw_to_2a.py (group-level rules, Fried Specialties rule,
+  side_rules tab), scripts/action2_ocr_to_2b_0625v2.py (missing-table
+  warning), scripts/action3_compare_and_merge.py (entry CF rules, x on
+  Modifier Summary, legend), scripts/action4_apply_modifier_changes.py,
+  scripts/action5_to_raw_gsheet.py, scripts/modifier_rule_pricing.py (live
+  'by itself', FS-tab drift, apply writes only instructions),
+  scripts/price_inference.py (Healthy only when not on paper),
+  scripts/wsheet_xlsx_bridge.py (new-price fills), scripts/part2_report.py,
+  references/price-inference.md.
+Unchanged in this batch: specialist_requests, crop_section, ocr_sanity_check,
+  price_queue_gate, hook, setup.sh, cuisine modules, ocr-prompt.md.
+See ../CHANGELOG.md.
+
+v4.4 (cont. 3) AMENDMENT (self-audit fixes, 2026-09-30 night) — deliberate
+maintainer edit to locked scripts. The fidelity lock still applies at RUN
+time to these new bytes. Changed:
+  scripts/action1_raw_to_2a.py ($0 guard: group-level rules need a priced
+  By Itself or a required choice; side_rules = real side tables),
+  scripts/action2_ocr_to_2b_0625v2.py (Unplaced Prices → P-SIZE; OCR prices
+  normalised to numbers), scripts/action3_compare_and_merge.py
+  (hidden _ref_sys_ / _ref_key: columns next to the data, 6 not-a-price CF
+  rules matching Part 2, numeric apricot rule, Modifier Summary sizes),
+  scripts/action4_apply_modifier_changes.py, scripts/action5_to_raw_gsheet.py
+  (Part 1 changes from _ref_sys_, rows by key, misplaced decimal / percent /
+  empty-cell rules, twins, refusals), scripts/modifier_rule_pricing.py
+  (apply validates input, holds By Itself → 0, hidden _ref_live / _ref_key;
+  group-level G11; NO DISH RULES / NO SIDE RULES), scripts/price_inference.py
+  (qualifiers, same dish in two groups, re-run undo, stale-report check),
+  scripts/wsheet_xlsx_bridge.py (control characters, skipped tab / stale TSV
+  exit 1), scripts/part2_report.py, references/price-inference.md.
+Unchanged in this batch: specialist_requests, crop_section,
+  ocr_sanity_check, price_queue_gate, hook, setup.sh, cuisine modules,
+  ocr-prompt.md.
+See ../CHANGELOG.md.
+
+v4.4 (cont. 4) AMENDMENT (dish codes, Party Tray per dish group, the
+maintainer's answers, 2026-10-05) — deliberate maintainer edit to locked
+scripts. The fidelity lock still applies at RUN time to these new bytes.
+Changed:
+  scripts/action1_raw_to_2a.py (System Codes sheet), scripts/action2_ocr_to_2b_0625v2.py
+  (printed codes → Paper Codes / Code Conflicts, by the size each price
+  landed in), scripts/action3_compare_and_merge.py (Dish Code tab, P-CODE),
+  scripts/action4_apply_modifier_changes.py (clear stop for a report that lost
+  its hidden data), scripts/action5_to_raw_gsheet.py (writes the codes the
+  specialist confirmed; the old automatic code path removed),
+  scripts/wsheet_xlsx_bridge.py (code fills / clears), scripts/part2_report.py,
+  scripts/price_inference.py (T-TRAY per dish group),
+  scripts/modifier_rule_pricing.py (tab order), references/price-inference.md.
+  Review fixes, same day: action2 (a printed number is a code only when
+  clearly one; lunch-special codes only on Lunch; codes reaching one size
+  through routing compared), action3 (tab colours read codes like action5; red
+  on a grey cell; a tab for conflicts only), action4 (Dish Code formulas →
+  saved values), action5 (code columns found after a header paste, else a
+  stop; codes normalised; follow-ups re-checked), bridge (codes compared the
+  same way), part2_report, price_inference (two-group trays derived only when
+  every group agrees). Then the maintainer's follow-up: two different
+  prices printed for one size are asked (action2 'Price Conflicts' sheet,
+  action3 P-PRICE, price_inference skips those cells).
+Unchanged in this batch: specialist_requests, crop_section, ocr_sanity_check,
+  price_queue_gate, hook, setup.sh, cuisine modules, ocr-prompt.md.
+See ../CHANGELOG.md.
+
+v4.5 AMENDMENT (Fried Specialty / Modifier Rule tabs, 2026-10-16) — deliberate
+maintainer edit. Changed: scripts/modifier_rule_pricing.py (the Fried Specialty
+pattern found from the system alone; both tabs built with no or a partial paper
+table; the Fried Specialty tab rebuilt as FULL PRICE / PRICE DIFFERENCE /
+ABSOLUTE PRICE tables + Notes → Wonka; Questionnaire P-FS; apply reads the
+tables and reports tab conflicts), scripts/specialist_requests.py (the tab's
+notes), scripts/part2_report.py, ../menu-change-workflow-part1.md / part2.md.

@@ -225,6 +225,19 @@ def _extract_prefix_code(name: str) -> Tuple[Optional[str], str]:
         return match.group(1).strip(), match.group(2).strip()
     return None, name
 
+
+def _printed_code_of(raw_name: str) -> Optional[str]:
+    """The menu number printed at the start of a name, as a dish code for the
+    Dish Code tab — only when it is clearly one: it has a letter (A1, L15, 12a)
+    or is followed by '.' / ')' ('15. General Tso'). A bare number before a
+    space is a count as often as a code ('10 Fried Dumplings') — not proposed."""
+    m = re.match(r'^\s*([A-Za-z]?\d+[a-zA-Z]?)\s*([.)]|\s)', raw_name or '')
+    if not m:
+        return None
+    if re.search(r'[A-Za-z]', m.group(1)) or m.group(2) in '.)':
+        return m.group(1)
+    return None
+
 def _extract_quantity(name: str) -> Tuple[Optional[str], str]:
     match = re.search(r'\s*\(\s*(\d+)\s*\)\s*$', name)
     if match:
@@ -665,16 +678,27 @@ def map_prices_to_2a_row(row_2a_prices: Dict[str, Optional[float]],
                          ocr_prices: Dict[str, float]):
     """Map OCR (paper) prices onto the system row's variant columns.
 
-    Returns (mapped, inferred) where:
+    Returns (mapped, inferred, unplaced, src) where:
       - mapped:   {variant -> price} to write
       - inferred: list of {'paper_variant','target_variant','price'} for any
                   price whose paper variant column is blank in the system row
                   but exactly one other variant column is populated, so we
                   route it there instead of silently dropping it (§ column
                   inference / silent-G1 fix).
+      - unplaced: list of {'paper_variant','price'} — printed prices for a size
+                  the system dish does not have that could not be routed (it
+                  has several other sizes, or none; a tray on a dish without a
+                  tray price). Never written (G1), but never dropped silently
+                  either: action3 asks about each (Questionnaire P-SIZE).
+      - src:      {system variant -> [every paper variant whose price landed
+                  there, in order]} — the last one is the price written; an
+                  earlier one was overwritten (two printed prices for one size).
+                  The printed dish codes of all of them belong to that size.
     """
     mapped = {}
     inferred = []
+    unplaced = []
+    src = defaultdict(list)
     has = {v for v, p in row_2a_prices.items() if p is not None}
 
     for var, price in ocr_prices.items():
@@ -684,14 +708,19 @@ def map_prices_to_2a_row(row_2a_prices: Dict[str, Optional[float]],
             # price (G1); never fall through to the re-routing below.
             if var in has:
                 mapped[var] = price
+                src[var].append(var)
+            else:
+                unplaced.append({'paper_variant': var, 'price': price})
             continue
         if var in has:
             mapped[var] = price
+            src[var].append(var)
             continue
         placed = False
         if var == 'Order' and 'Order' not in has:
             if 'Large' in has and 'Small' not in has:
                 mapped['Large'] = price
+                src['Large'].append(var)
                 placed = True
             elif 'Large' in has and 'Small' in has:
                 old_sm = row_2a_prices.get('Small', 0) or 0
@@ -701,10 +730,13 @@ def map_prices_to_2a_row(row_2a_prices: Dict[str, Optional[float]],
                     dist_lg = abs(price - old_lg)
                     if dist_sm < dist_lg:
                         mapped['Small'] = price
+                        src['Small'].append(var)
                     else:
                         mapped['Large'] = price
+                        src['Large'].append(var)
                 else:
                     mapped['Large'] = price
+                    src['Large'].append(var)
                 placed = True
         if not placed and len(has) == 1:
             # Name matched but the paper's variant column is blank in the
@@ -713,12 +745,16 @@ def map_prices_to_2a_row(row_2a_prices: Dict[str, Optional[float]],
             target = next(iter(has))
             if target not in mapped:
                 mapped[target] = price
+                src[target].append(var)
                 inferred.append({
                     'paper_variant': var,
                     'target_variant': target,
                     'price': price,
                 })
-    return mapped, inferred
+                placed = True
+        if not placed:
+            unplaced.append({'paper_variant': var, 'price': price})
+    return mapped, inferred, unplaced, src
 
 def detect_variant_style(p_headers: list, price_rows: list) -> str:
     from collections import Counter
@@ -820,6 +856,43 @@ def read_2a(path: str):
     wb.close()
     return p_headers, price_rows, m_headers, mod_rows
 
+
+def read_absolute_cells(path: str) -> Dict[Tuple[str, str], dict]:
+    """(dish, variant) → {'source','by_itself','evidence'} from the Menu
+    Preview's 'absolute_pricing' tab (action1, v4.4): $0.00 dish cells whose
+    price lives on modifiers. Empty for an older Menu Preview without the tab."""
+    wb = load_workbook(path, read_only=True)
+    out = {}
+    if 'absolute_pricing' in wb.sheetnames:
+        rows = list(wb['absolute_pricing'].iter_rows(values_only=True))
+        hdr = [str(c).strip() if c else '' for c in rows[0]] if rows else []
+        col = {h: i for i, h in enumerate(hdr)}
+        for r in rows[1:]:
+            def _g(h):
+                i = col.get(h)
+                return str(r[i]).strip() if i is not None and i < len(r) and r[i] is not None else ''
+            if _g('Dish Name') and _g('Variant'):
+                out[(_g('Dish Name'), _g('Variant'))] = {
+                    'source': _g('Source'), 'by_itself': _g('By Itself Rule'),
+                    'evidence': _g('Evidence'), 'modifier_group': _g('Modifier Group')}
+    wb.close()
+    return out
+
+def read_side_rule_dishes(path: str) -> Dict[str, Tuple[int, str]]:
+    """dish → (priced rule count, sample modifiers) from the Menu Preview's
+    'side_rules' tab (action1): dishes priced with side-combo modifier rules.
+    Empty for an older Menu Preview without the tab."""
+    wb = load_workbook(path, read_only=True)
+    out = {}
+    if 'side_rules' in wb.sheetnames:
+        for r in list(wb['side_rules'].iter_rows(values_only=True))[1:]:
+            if r and len(r) > 1 and r[1]:
+                out[str(r[1]).strip()] = (r[2] if len(r) > 2 else 0,
+                                          str(r[3]).strip() if len(r) > 3 and r[3] else '')
+    wb.close()
+    return out
+
+
 def validate_json(data: dict) -> List[str]:
     warnings = []
     if 'restaurant' not in data:
@@ -895,12 +968,52 @@ def _is_code_match_plausible(ocr_name: str, sys_name: str) -> bool:
     return len(overlap) > 0
 
 
+
+def _numeric_prices(node, path='', out=None):
+    """Make every price in the OCR JSON a number, in place: "$9.59" / "9.59" →
+    9.59 (a model sometimes writes prices as text); anything else ("MP",
+    "market") → null, listed in the returned messages — never a crash, never
+    silently read as a price. Keys: prices / side_prices (dict or list),
+    price, default_price."""
+    out = [] if out is None else out
+
+    def num(v, where):
+        if v is None or isinstance(v, bool):
+            return None
+        if isinstance(v, (int, float)):
+            return float(v)
+        s = str(v).strip().replace('$', '').replace(',', '')
+        try:
+            return float(s) if s else None
+        except ValueError:
+            out.append(f"NOT A PRICE in the OCR JSON: {where} = {v!r} — not read")
+            return None
+
+    if isinstance(node, dict):
+        name = node.get('name') or node.get('menu_section') or path
+        for k, v in list(node.items()):
+            if k in ('prices', 'side_prices') and isinstance(v, dict):
+                node[k] = {kk: num(vv, f"{name} {k}[{kk}]") for kk, vv in v.items()}
+            elif k in ('prices', 'side_prices') and isinstance(v, list):
+                node[k] = [num(vv, f"{name} {k}[{i}]") for i, vv in enumerate(v)]
+            elif k in ('price', 'default_price') and not isinstance(v, (dict, list)):
+                node[k] = num(v, f"{name} {k}")
+            elif isinstance(v, (dict, list)):
+                _numeric_prices(v, f"{path}/{k}", out)
+    elif isinstance(node, list):
+        for i, v in enumerate(node):
+            _numeric_prices(v, f"{path}[{i}]", out)
+    return out
+
+
 def build_2b(ocr_path: str, path_2a: str, dict_path: str = None, output_path: str = None) -> dict:
     with open(ocr_path, 'r', encoding='utf-8') as f:
         ocr = json.load(f)
 
-    warnings = validate_json(ocr)
+    not_prices = _numeric_prices(ocr)
+    warnings = validate_json(ocr) + not_prices
     p_headers, price_rows, m_headers, mod_rows = read_2a(path_2a)
+    absolute_cells = read_absolute_cells(path_2a)
     variant_style = detect_variant_style(p_headers, price_rows)
 
     equiv = {}
@@ -922,10 +1035,20 @@ def build_2b(ocr_path: str, path_2a: str, dict_path: str = None, output_path: st
                 sys_names.append(n)
 
     ocr_index = defaultdict(dict)
+    # every printed price per dish and paper size — ocr_index keeps only the
+    # last one; two different prices for one size are asked (P-PRICE), never picked
+    printed_all = defaultdict(lambda: defaultdict(list))   # dish (lower) → paper size → [(price, section, name)]
+
+    def _record(sys_name, prices, section, printed_name):
+        for v, p in prices.items():
+            ocr_index[sys_name.lower()][v] = p
+            printed_all[sys_name.lower()][v].append((p, section, printed_name))
+
     match_log = []
     unmatched = []
     flagged_code_matches = []  # P4: code matched but name similarity too low
     inferred_routings = []  # P-COLUMN: paper variant blank in system, routed to the one populated column
+    unplaced_prices = []    # P-SIZE: a printed price for a size the system dish does not have
 
     def _is_drink(name: str) -> bool:
         n = name.lower()
@@ -1086,6 +1209,9 @@ def build_2b(ocr_path: str, path_2a: str, dict_path: str = None, output_path: st
         qty, cleaned_name = _extract_quantity(cleaned_name)
         
         active_code = original_code if original_code else code
+        # the code proposed on the Dish Code tab: the OCR's code field, or a
+        # printed prefix only when it is clearly a code (not a count)
+        paper_code = original_code if original_code else _printed_code_of(raw_menu_name)
 
         remapped_prices = remap_ocr_prices(prices, variant_style)
 
@@ -1102,7 +1228,8 @@ def build_2b(ocr_path: str, path_2a: str, dict_path: str = None, output_path: st
             expanded = _expand_parenthetical(cleaned_name, remapped_prices)
             if len(expanded) > 1:
                 for exp_name, exp_prices in expanded:
-                    _process_single(exp_name, exp_prices, section_name, active_code, raw_menu_name)
+                    _process_single(exp_name, exp_prices, section_name, active_code, raw_menu_name,
+                                    paper_code)
                 return
 
         candidates = split_compound_item(cleaned_name) if is_compound else [cleaned_name]
@@ -1112,26 +1239,23 @@ def build_2b(ocr_path: str, path_2a: str, dict_path: str = None, output_path: st
             match = resolve_name(cand, sys_names, equiv)
             if match:
                 sys_name, method = match
-                match_log.append({'menu': cand, 'system': sys_name, 'method': method, 'original': raw_menu_name, 'code': active_code, 'clean_name': cleaned_name, 'code_slots': sorted(remapped_prices.keys())})
-                for v, p in remapped_prices.items():
-                    ocr_index[sys_name.lower()][v] = p
+                match_log.append({'menu': cand, 'system': sys_name, 'method': method, 'original': raw_menu_name, 'code': active_code, 'paper_code': paper_code, 'clean_name': cleaned_name, 'code_slots': sorted(remapped_prices.keys())})
+                _record(sys_name, remapped_prices, section_name, raw_menu_name)
                 any_matched = True
             else:
                 prefix_match = _try_with_section_prefix(cand, section_name)
                 if prefix_match:
                     sys_name, method = prefix_match
-                    match_log.append({'menu': cand, 'system': sys_name, 'method': f'section_prefix+{method}', 'original': raw_menu_name, 'code': active_code, 'clean_name': cleaned_name, 'code_slots': sorted(remapped_prices.keys())})
-                    for v, p in remapped_prices.items():
-                        ocr_index[sys_name.lower()][v] = p
+                    match_log.append({'menu': cand, 'system': sys_name, 'method': f'section_prefix+{method}', 'original': raw_menu_name, 'code': active_code, 'paper_code': paper_code, 'clean_name': cleaned_name, 'code_slots': sorted(remapped_prices.keys())})
+                    _record(sys_name, remapped_prices, section_name, raw_menu_name)
                     any_matched = True
                     
         if not any_matched:
             # §2.6 — strict unique-substring auto-match before giving up.
             uniq = _unique_substring_match(cleaned_name, sys_names)
             if uniq:
-                match_log.append({'menu': cleaned_name, 'system': uniq, 'method': 'unique_substring', 'original': raw_menu_name, 'code': active_code, 'clean_name': cleaned_name, 'code_slots': sorted(remapped_prices.keys())})
-                for v, p in remapped_prices.items():
-                    ocr_index[uniq.lower()][v] = p
+                match_log.append({'menu': cleaned_name, 'system': uniq, 'method': 'unique_substring', 'original': raw_menu_name, 'code': active_code, 'paper_code': paper_code, 'clean_name': cleaned_name, 'code_slots': sorted(remapped_prices.keys())})
+                _record(uniq, remapped_prices, section_name, raw_menu_name)
                 return
             # CODE TIE-BREAKER: name resolution
             # produced no candidate. Consult the code as a last resort, but ONLY
@@ -1141,9 +1265,8 @@ def build_2b(ocr_path: str, path_2a: str, dict_path: str = None, output_path: st
                 sys_name_from_code = _check_code_match(active_code, section_name, code_index)
                 if sys_name_from_code:
                     if _is_code_match_plausible(cleaned_name, sys_name_from_code):
-                        match_log.append({'menu': cleaned_name, 'system': sys_name_from_code, 'method': 'code_tiebreaker', 'original': raw_menu_name, 'code': active_code, 'clean_name': cleaned_name, 'code_slots': sorted(remapped_prices.keys())})
-                        for v, p in remapped_prices.items():
-                            ocr_index[sys_name_from_code.lower()][v] = p
+                        match_log.append({'menu': cleaned_name, 'system': sys_name_from_code, 'method': 'code_tiebreaker', 'original': raw_menu_name, 'code': active_code, 'paper_code': paper_code, 'clean_name': cleaned_name, 'code_slots': sorted(remapped_prices.keys())})
+                        _record(sys_name_from_code, remapped_prices, section_name, raw_menu_name)
                         return
                     else:
                         flagged_code_matches.append({
@@ -1156,27 +1279,24 @@ def build_2b(ocr_path: str, path_2a: str, dict_path: str = None, output_path: st
                         })
             unmatched.append({'section': section_name, 'name': raw_menu_name, 'clean_name': cleaned_name, 'code': active_code, 'prices': remapped_prices})
 
-    def _process_single(cand_name, prices, section_name, code, original_raw_name):
+    def _process_single(cand_name, prices, section_name, code, original_raw_name, paper_code=None):
         match = resolve_name(cand_name, sys_names, equiv)
         if match:
             sys_name, method = match
-            match_log.append({'menu': cand_name, 'system': sys_name, 'method': method, 'original': original_raw_name, 'code': code, 'clean_name': cand_name, 'code_slots': sorted(prices.keys())})
-            for v, p in prices.items():
-                ocr_index[sys_name.lower()][v] = p
+            match_log.append({'menu': cand_name, 'system': sys_name, 'method': method, 'original': original_raw_name, 'code': code, 'paper_code': paper_code, 'clean_name': cand_name, 'code_slots': sorted(prices.keys())})
+            _record(sys_name, prices, section_name, original_raw_name)
         else:
             prefix_match = _try_with_section_prefix(cand_name, section_name)
             if prefix_match:
                 sys_name, method = prefix_match
-                match_log.append({'menu': cand_name, 'system': sys_name, 'method': f'section_prefix+{method}', 'original': original_raw_name, 'code': code, 'clean_name': cand_name, 'code_slots': sorted(prices.keys())})
-                for v, p in prices.items():
-                    ocr_index[sys_name.lower()][v] = p
+                match_log.append({'menu': cand_name, 'system': sys_name, 'method': f'section_prefix+{method}', 'original': original_raw_name, 'code': code, 'paper_code': paper_code, 'clean_name': cand_name, 'code_slots': sorted(prices.keys())})
+                _record(sys_name, prices, section_name, original_raw_name)
             else:
                 # §2.6 — strict unique-substring auto-match before giving up.
                 uniq = _unique_substring_match(cand_name, sys_names)
                 if uniq:
-                    match_log.append({'menu': cand_name, 'system': uniq, 'method': 'unique_substring', 'original': original_raw_name, 'code': code, 'clean_name': cand_name, 'code_slots': sorted(prices.keys())})
-                    for v, p in prices.items():
-                        ocr_index[uniq.lower()][v] = p
+                    match_log.append({'menu': cand_name, 'system': uniq, 'method': 'unique_substring', 'original': original_raw_name, 'code': code, 'paper_code': paper_code, 'clean_name': cand_name, 'code_slots': sorted(prices.keys())})
+                    _record(uniq, prices, section_name, original_raw_name)
                     return
                 unmatched.append({'section': section_name, 'name': original_raw_name, 'clean_name': cand_name, 'code': code, 'prices': prices})
 
@@ -1207,8 +1327,11 @@ def build_2b(ocr_path: str, path_2a: str, dict_path: str = None, output_path: st
             name = item.get('name', '')
             inline_code = item.get('code')
             prices = {k: v for k, v in item.get('prices', {}).items() if v is not None}
-            
-            if not prices and sec_fallback is not None:
+
+            # A row carrying side_prices is priced WITH a side (e.g. "Appetizer
+            # Combos — all served w. fries or fried rice $10.95"): the box's
+            # floating price is that combo total, never the dish's own price.
+            if not prices and sec_fallback is not None and not item.get('side_prices'):
                 fallback_variant = 'Combo' if resolved_sec == 'combinations' else 'Order'
                 prices = {fallback_variant: sec_fallback}
 
@@ -1270,8 +1393,26 @@ def build_2b(ocr_path: str, path_2a: str, dict_path: str = None, output_path: st
 
     price_col_indices = set(var_cols.values())
 
+    group_col = p_headers.index('Dish Group') if 'Dish Group' in p_headers else 0
     matched_count = 0
     unmatched_2a = 0
+    absolute_held = []      # P-ABS: paper prices NOT written onto a $0 modifier-priced dish
+    held_seen = set()
+    # Printed dish codes (the OCR item's `code`, or a printed prefix that is
+    # clearly a code: "L15", "15.") per system dish, by the paper sizes the
+    # printed row carried: a code goes on the system size its price landed in —
+    # one number on a two-size row → both sizes; a Lunch-section "L26" → Lunch
+    # only, never another size (maintainer, 2026-10-05).
+    codes_by_slot = defaultdict(lambda: defaultdict(set))   # dish (lower) → paper size → {codes}
+    for m in match_log:
+        code = str(m.get('paper_code') or '').strip()
+        if code and m.get('system'):
+            for slot in m.get('code_slots') or []:
+                codes_by_slot[m['system'].lower()][slot].add(code)
+    paper_codes = {}        # (sheet row, system size) → printed code
+    code_conflicts = []     # two different codes printed for one dish + size — asked (P-CODE)
+    price_conflicts = []    # two different prices printed for one dish + size — asked (P-PRICE)
+    conflict_seen = set()
     for ri, row_data in enumerate(price_rows[1:], 2):
         for ci in range(len(row_data)):
             if ci in price_col_indices:
@@ -1295,8 +1436,90 @@ def build_2b(ocr_path: str, path_2a: str, dict_path: str = None, output_path: st
             # (replaces the old global remap_ocr_prices). Keeps Soup / White Rice
             # genuine Small prices intact; routes mains' Small→Lunch only where the
             # row actually has a Lunch slot and no Small slot.
+            pre_route = ocr_raw
             ocr_raw = _route_small_to_lunch_for_row(ocr_raw, row_2a_prices, variant_style)
-            mapped, inferred = map_prices_to_2a_row(row_2a_prices, ocr_raw)
+            mapped, inferred, unplaced, src = map_prices_to_2a_row(row_2a_prices, ocr_raw)
+            # paper 'Lunch' here may be the routed paper Small — then a Lunch price
+            # printed too (a lunch special) was overwritten; both rows' codes
+            # were printed for this Lunch size
+            routed = 'Small' in pre_route and 'Small' not in ocr_raw and 'Lunch' in ocr_raw
+            by_slot = codes_by_slot.get(dish_name.lower(), {})
+            for s_v, p_keys in src.items():
+                slots = []
+                for p_key in p_keys:
+                    slots += (['Small'] + (['Lunch'] if 'Lunch' in pre_route else [])
+                              if routed and p_key == 'Lunch' else [p_key])
+                # a Lunch / Dinner section's code belongs on that size only (DC5)
+                cset = set().union(*(by_slot.get(sl, set()) for sl in slots
+                                     if sl not in ('Lunch', 'Dinner') or sl == s_v))
+                if len(cset) == 1:
+                    paper_codes[(ri, s_v)] = next(iter(cset))
+                elif len(cset) > 1:
+                    code_conflicts.append({
+                        'group': str(row_data[group_col]).strip() if len(row_data) > group_col and row_data[group_col] else '',
+                        'dish_name': dish_name, 'variant': s_v, 'codes': sorted(cset)})
+            # Two different printed prices for one system size — the dish printed in
+            # two sections, an Order price routed onto a printed Large, a Small
+            # routed onto a printed lunch special: neither is written, the
+            # specialist asks on the callback (P-PRICE; maintainer 2026-10-05,
+            # "be safe"). The same price printed twice is no conflict.
+            printed_for = {}
+            for s_v in mapped:
+                seen_p = []
+                for p_key in src.get(s_v, []):
+                    for k in (['Small'] + (['Lunch'] if 'Lunch' in pre_route else [])
+                              if routed and p_key == 'Lunch' else [p_key]):
+                        seen_p += [(round(p, 2), sec, nm, k)
+                                   for p, sec, nm in printed_all[dish_name.lower()].get(k, [])]
+                if len({x[0] for x in seen_p}) > 1:
+                    printed_for[s_v] = list(dict.fromkeys(seen_p))
+            # a $0.00 size priced on its By Itself rule (ABSOLUTE): a paper price
+            # under another size name may be that plain price
+            abs_bi = [(v, bp) for (d, v), info in absolute_cells.items() if d == dish_name
+                      for bp in [_parse_price(info.get('by_itself'))] if bp is not None]
+            for u in unplaced:
+                if any(abs(bi - u['price']) < 0.005 for _v, bi in abs_bi):
+                    continue        # = the By Itself price of its $0.00 size — already in the system
+                unplaced_prices.append({
+                    'group': str(row_data[group_col]).strip() if len(row_data) > group_col and row_data[group_col] else '',
+                    'dish_name': dish_name, 'paper_variant': u['paper_variant'], 'price': u['price'],
+                    'sizes': ', '.join(v for v, p in row_2a_prices.items() if p is not None),
+                    'note': (f"probably the plain price of its $0.00 size {abs_bi[0][0]} (By Itself rule "
+                             f"{_fmt(abs_bi[0][1])})" if abs_bi else '')})
+            # G11 (v4.4): a $0.00 dish whose price lives on modifiers (ABSOLUTE)
+            # never takes the paper price — the customer would pay it on top of
+            # the modifier price. The cell stays blank here (so action3 keeps
+            # the system $0.00 and price_inference leaves it alone) and the
+            # paper price goes to the P-ABS callback list instead.
+            for v in list(mapped):
+                info = absolute_cells.get((dish_name, v))
+                if (info is None or row_2a_prices.get(v) is None
+                        or abs(row_2a_prices[v]) > 0.001 or abs(mapped[v]) <= 0.001):
+                    continue
+                if (dish_name, v) not in held_seen:
+                    held_seen.add((dish_name, v))
+                    two = (f" The paper prints two different prices for it "
+                           f"({' / '.join(_fmt(p) for p in sorted({x[0] for x in printed_for[v]}))}) — "
+                           f"ask which is right." if v in printed_for else '')
+                    absolute_held.append({
+                        'group': str(row_data[group_col]).strip() if len(row_data) > group_col and row_data[group_col] else '',
+                        'dish_name': dish_name, 'variant': v, 'price': mapped[v],
+                        'source': info['source'], 'by_itself': info['by_itself'],
+                        'evidence': info['evidence'] + two, 'modifier_group': info['modifier_group']})
+                del mapped[v]
+            for v, seen_p in printed_for.items():
+                if v not in mapped:
+                    continue                      # held for P-ABS, which names both prices
+                del mapped[v]
+                if (dish_name, v) not in conflict_seen:
+                    conflict_seen.add((dish_name, v))
+                    price_conflicts.append({
+                        'group': str(row_data[group_col]).strip() if len(row_data) > group_col and row_data[group_col] else '',
+                        'dish_name': dish_name, 'variant': v,
+                        'prices': ' / '.join(_fmt(p) for p in sorted({x[0] for x in seen_p})),
+                        'printed': '; '.join(f"{sec or '?'}: {nm} [{k}] {_fmt(p)}" for p, sec, nm, k in seen_p),
+                        'system': row_2a_prices.get(v)})
+            inferred = [inf for inf in inferred if inf['target_variant'] in mapped]
             for v, ci in var_cols.items():
                 if v in mapped:
                     ws.cell(row=ri, column=ci+1, value=_fmt(mapped[v]))
@@ -1372,15 +1595,17 @@ def build_2b(ocr_path: str, path_2a: str, dict_path: str = None, output_path: st
     # for fried items with different side options). Supports both:
     #   - New format: side_pricing at section level, side_prices on each item
     #   - Legacy format: fried_specialty_sides top-level key (array-based)
-    # Passes through as a sheet so action3/3b/3c can use it.
-    fs_columns = None
-    fs_items = []
+    # Passes through as a sheet so action3/3b/3c can use it. EVERY multi-column
+    # section is passed (v4.4; a second table such as Wings used to be dropped),
+    # one block each: a 'Section' | <name> row, then its own header row.
+    fs_blocks = []          # [(section_name, columns, items)]
 
     # New format: look for side_pricing in sections
     for sec in ocr.get('sections', []):
         sp = sec.get('side_pricing')
         if sp and sp.get('columns'):
             fs_columns = sp['columns']
+            fs_items = []
             for item in sec.get('items', []):
                 if item.get('side_prices'):
                     plain_price = None
@@ -1394,26 +1619,59 @@ def build_2b(ocr_path: str, path_2a: str, dict_path: str = None, output_path: st
                         'name': item.get('name', ''),
                         'prices': row_prices
                     })
-            break  # only one section with side_pricing expected
+            if fs_items:
+                fs_blocks.append((sec.get('menu_section', ''), fs_columns, fs_items))
 
     # Legacy format fallback: fried_specialty_sides top-level key
-    if not fs_items:
+    if not fs_blocks:
         legacy = ocr.get('fried_specialty_sides')
         if legacy and legacy.get('items'):
-            fs_columns = legacy.get('columns', [])[1:]  # skip "Plain" column header
-            fs_items = legacy['items']
+            fs_blocks.append(('Fried Specialties', legacy.get('columns', [])[1:],  # skip "Plain"
+                              legacy['items']))
 
-    if fs_columns and fs_items:
+    if fs_blocks:
         ws_fs = wb.create_sheet('Fried Specialty Sides')
-        fs_headers = ['Code', 'Name', 'Plain'] + fs_columns
-        for ci, h in enumerate(fs_headers, 1):
-            ws_fs.cell(row=1, column=ci, value=h).font = HEADER_FONT
-        for ri, item in enumerate(fs_items, 2):
-            ws_fs.cell(row=ri, column=1, value=item.get('code', ''))
-            ws_fs.cell(row=ri, column=2, value=item.get('name', ''))
-            for pi, price in enumerate(item.get('prices', []), 3):
-                if price is not None:
-                    ws_fs.cell(row=ri, column=pi, value=price)
+        ri = 1
+        for sec_name, fs_columns, fs_items in fs_blocks:
+            ws_fs.cell(row=ri, column=1, value='Section').font = HEADER_FONT
+            ws_fs.cell(row=ri, column=2, value=sec_name).font = HEADER_FONT
+            ri += 1
+            fs_headers = ['Code', 'Name', 'Plain'] + fs_columns
+            for ci, h in enumerate(fs_headers, 1):
+                ws_fs.cell(row=ri, column=ci, value=h).font = HEADER_FONT
+            ri += 1
+            for item in fs_items:
+                ws_fs.cell(row=ri, column=1, value=item.get('code', ''))
+                ws_fs.cell(row=ri, column=2, value=item.get('name', ''))
+                for pi, price in enumerate(item.get('prices', []), 3):
+                    if price is None:
+                        continue
+                    pv = _parse_price(price)
+                    if pv is None:
+                        # "MP", "market" … — no number to compare: say so, never crash
+                        warnings.append(f"NOT A PRICE in side_prices: '{item.get('name', '')}' "
+                                        f"{fs_headers[pi - 1] if pi - 1 < len(fs_headers) else ''} = {price!r} "
+                                        f"— not compared")
+                        continue
+                    ws_fs.cell(row=ri, column=pi, value=pv)
+                ri += 1
+
+    # ── Absolute Held sheet (P-ABS passthrough) ──────────────────
+    # Paper prices deliberately NOT written above: the system dish is $0.00
+    # and its price lives on modifiers (Menu Preview 'absolute_pricing').
+    # action3 reads this sheet for the P-ABS questionnaire block.
+    if absolute_held:
+        ws_ah = wb.create_sheet('Absolute Held')
+        ah_headers = ['Dish Group', 'Dish Name', 'Variant', 'Menu Price', 'System Price',
+                      'Source', 'By Itself Rule', 'Evidence', 'Modifier Group']
+        for ci, h in enumerate(ah_headers, 1):
+            ws_ah.cell(row=1, column=ci, value=h).font = HEADER_FONT
+        for ri, h in enumerate(absolute_held, 2):
+            for ci, val in enumerate([h['group'], h['dish_name'], h['variant'], _fmt(h['price']),
+                                      '$0.00', h['source'], h['by_itself'], h['evidence'],
+                                      h['modifier_group']], 1):
+                if val:
+                    ws_ah.cell(row=ri, column=ci, value=val)
 
     # ── Inferred Columns sheet (P-COLUMN passthrough) ────────────
     # One row per price whose paper variant column was blank in the system
@@ -1439,10 +1697,80 @@ def build_2b(ocr_path: str, path_2a: str, dict_path: str = None, output_path: st
         ws_ic.column_dimensions['D'].width = 10
         ws_ic.column_dimensions['E'].width = 60
 
+    # ── Paper Codes sheet (Dish Code tab passthrough) ────────────
+    # The printed dish code of each system size that received a paper price,
+    # row-aligned with 'price'. action3 shows it next to the system code on the
+    # report's Dish Code tab; nothing is written unless the specialist confirms
+    # the cell there (maintainer, 2026-10-05).
+    if paper_codes or code_conflicts:
+        ws_pc = wb.create_sheet('Paper Codes')
+        for ci, h in enumerate(p_headers):
+            ws_pc.cell(row=1, column=ci + 1, value=h).font = HEADER_FONT
+        for ri, row_data in enumerate(price_rows[1:], 2):
+            for ci in range(len(row_data)):
+                if ci not in price_col_indices and row_data[ci] is not None:
+                    ws_pc.cell(row=ri, column=ci + 1, value=str(row_data[ci]).strip())
+        for (ri, v), code in paper_codes.items():
+            ws_pc.cell(row=ri, column=var_cols[v] + 1, value=code).number_format = '@'
+    if code_conflicts:
+        ws_cc = wb.create_sheet('Code Conflicts')
+        for ci, h in enumerate(['Dish Group', 'Dish Name', 'Variant', 'Printed Codes'], 1):
+            ws_cc.cell(row=1, column=ci, value=h).font = HEADER_FONT
+        for ri, c in enumerate(code_conflicts, 2):
+            for ci, val in enumerate([c['group'], c['dish_name'], c['variant'], ' / '.join(c['codes'])], 1):
+                ws_cc.cell(row=ri, column=ci, value=val)
+
+    # ── Price Conflicts sheet (P-PRICE passthrough) ──────────────
+    # Two different prices printed for one system size: neither was written
+    # (the cell is blank above), action3 asks about each (Questionnaire
+    # P-PRICE), price_inference never infers or uses that cell.
+    if price_conflicts:
+        ws_pp = wb.create_sheet('Price Conflicts')
+        for ci, h in enumerate(['Dish Group', 'Dish Name', 'Variant', 'Printed Prices', 'Printed As',
+                                'System Price'], 1):
+            ws_pp.cell(row=1, column=ci, value=h).font = HEADER_FONT
+        for ri, c in enumerate(price_conflicts, 2):
+            for ci, val in enumerate([c['group'], c['dish_name'], c['variant'], c['prices'], c['printed'],
+                                      _fmt(c['system']) if c['system'] is not None else ''], 1):
+                ws_pp.cell(row=ri, column=ci, value=val)
+        for col, w in (('A', 24), ('B', 40), ('C', 14), ('D', 20), ('E', 90), ('F', 14)):
+            ws_pp.column_dimensions[col].width = w
+
+    # ── Unplaced Prices sheet (P-SIZE passthrough) ───────────────
+    # A printed price for a size the system dish does not have, that could not
+    # be routed to another column: never written (G1), never dropped silently.
+    # action3 asks about each (Questionnaire P-SIZE); price_inference counts the
+    # dish as on the paper.
+    if unplaced_prices:
+        ws_up = wb.create_sheet('Unplaced Prices')
+        for ci, h in enumerate(['Dish Group', 'Dish Name', 'Paper Variant', 'Price', 'Notes', 'System Sizes'], 1):
+            ws_up.cell(row=1, column=ci, value=h).font = HEADER_FONT
+        for ri, u in enumerate(unplaced_prices, 2):
+            ws_up.cell(row=ri, column=1, value=u['group'])
+            ws_up.cell(row=ri, column=2, value=u['dish_name'])
+            ws_up.cell(row=ri, column=3, value=u['paper_variant'])
+            ws_up.cell(row=ri, column=4, value=_fmt(u['price']))
+            ws_up.cell(row=ri, column=5, value=u['note'] or (f"Paper prints a '{u['paper_variant']}' price, but "
+                                                            f"the system dish has no '{u['paper_variant']}' price "
+                                                            f"— not compared"))
+            ws_up.cell(row=ri, column=6, value=u['sizes'])
+        for col, w in (('A', 24), ('B', 40), ('C', 16), ('D', 10), ('E', 70), ('F', 30)):
+            ws_up.column_dimensions[col].width = w
+
     wb.save(output_path)
     wb.close()
 
+    # Dishes the system prices with side-combo rules, read off the paper while
+    # the OCR JSON has NO multi-column (side_pricing) section: their side
+    # prices are then never compared (no Fried Specialty / Modifier Rule tab).
+    side_rule_dishes = read_side_rule_dishes(path_2a)
+    side_rules_unread = []
+    if side_rule_dishes and not fs_blocks:
+        side_rules_unread = [(d, n, smp) for d, (n, smp) in side_rule_dishes.items()
+                             if d.lower() in ocr_index]
+
     return {
+        'side_rules_unread': side_rules_unread,
         'matched': matched_count,
         'unmatched_menu': len(unmatched),
         'unmatched_2a': unmatched_2a,
@@ -1452,7 +1780,13 @@ def build_2b(ocr_path: str, path_2a: str, dict_path: str = None, output_path: st
         'unmatched_items': unmatched,
         'flagged_items': flagged_code_matches,
         'inferred_routings': inferred_routings,
+        'unplaced_prices': unplaced_prices,
+        'paper_codes': len(paper_codes),
+        'code_conflicts': code_conflicts,
+        'price_conflicts': price_conflicts,
         'variant_style': variant_style,
+        'absolute_held': absolute_held,
+        'side_sections': [name for name, _c, _i in fs_blocks],
     }
 
 
@@ -1591,10 +1925,43 @@ def main():
     print(f"\n{'='*50}")
     print(f"  Variant style: {vs} ({vs_label})")
     print(f"  Matched to system: {result['matched']}")
+    if result.get('paper_codes'):
+        print(f"  Printed dish codes carried to the Dish Code tab: {result['paper_codes']} size(s)")
+    for c in result.get('code_conflicts', [])[:10]:
+        print(f"  !! CODE CONFLICT: {c['dish_name']} [{c['variant']}] printed as {' and '.join(c['codes'])} "
+              f"— asked (P-CODE), not proposed")
+    for c in result.get('price_conflicts', [])[:10]:
+        print(f"  !! TWO PRICES PRINTED: {c['dish_name']} [{c['variant']}] {c['prices']} — not written, "
+              f"asked (P-PRICE)")
+    if result.get('unplaced_prices'):
+        print(f"  Printed prices for a size the dish does not have (P-SIZE, not compared): "
+              f"{len(result['unplaced_prices'])}")
+        for u in result['unplaced_prices'][:10]:
+            print(f"    - {u['dish_name']} [{u['paper_variant']}] {_fmt(u['price'])}")
     print(f"  Unmatched menu items (P1): {result['unmatched_menu']}")
     print(f"  Flagged code matches (P4): {result['flagged_code_matches']}")
     print(f"  System items without match: {result['unmatched_2a']}")
     print(f"  Name resolutions: {len(result['match_log'])}")
+    if result['side_sections']:
+        print(f"  Multi-column sections passed to Fried Specialty: {len(result['side_sections'])} "
+              f"({', '.join(result['side_sections'])})")
+    if result.get('side_rules_unread'):
+        sr = result['side_rules_unread']
+        print(f"\n  ⚠ NO MULTI-COLUMN TABLE IN THE OCR JSON: {len(sr)} dish(es) read from the paper "
+              f"are priced with side-combo rules in the system, but no section has side_pricing:")
+        for d, n, smp in sr[:8]:
+            print(f"    {d} — {n} priced rule(s){': ' + smp if smp else ''}")
+        if len(sr) > 8:
+            print(f"    ... +{len(sr) - 8} more")
+        print("    If the paper prints them in a table (Plain | w. French Fries | w. Fried Rice …), "
+              "add side_pricing + side_prices (ocr-prompt.md rule 5) and re-run action2. Otherwise "
+              "no Fried Specialty / Modifier Rule tab is built and their side prices are not checked.")
+    if result['absolute_held']:
+        print(f"\n  Held — $0.00 dish, price lives on modifiers (P-ABS, NOT written; G11): "
+              f"{len(result['absolute_held'])}")
+        for h in result['absolute_held']:
+            print(f"    {h['dish_name']} [{h['variant']}]: paper {_fmt(h['price'])} kept off "
+                  f"dish_item — {h['evidence']}")
 
     different = [m for m in result['match_log'] if m.get('clean_name', '').lower() != m['system'].lower() and m['menu'] != m['system']]
     if different:

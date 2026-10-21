@@ -1,5 +1,26 @@
+# Built skill packages (rebuild from the commit with git archive — see HANDOFF.md)
 *.zip
-.venv/
+
+# Python
 __pycache__/
+*.pyc
+.venv/
+venv/
+
+# Test runs
 tests/**/out*/
 tests/**/_work/
+
+# Real menu data never goes into git: reports, raws, OCR images
+*.xlsx
+*.xlsm
+*.tsv
+*.jpg
+*.jpeg
+*.png
+*.heic
+
+# macOS / editors
+.DS_Store
+.vscode/
+.idea/
