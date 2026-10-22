@@ -421,6 +421,72 @@ def twin(scripts, work):
           and f.get(('Teriyaki Beef', 'Order', 'Pork Fried Rice')) == '$2.60', f)
 
 
+def merged_columns(scripts, work):
+    print('\nSides at the same price on every row share one column — typed once, written to each')
+    M = ['French Fries', 'Plain Fried Rice', 'Fried Rice', 'Pork Fried Rice']
+
+    def setup(tag, paper):
+        d = os.path.join(work, 'merged_' + tag)
+        os.makedirs(d)
+        os.chdir(d)
+        dishes = [('Chicken Wings', 'Fried Specialties', {'Specialty': 7.99}),
+                  ('Chicken Fingers', 'Fried Specialties', {'Specialty': 8.50}),
+                  ('Teriyaki Beef', 'Fried Specialties', {'Order': 8.50}),
+                  ('Egg Roll', 'Appetizers', {'Order': 1.75})]
+        mod_groups = {S: (1, ['By Itself'] + M, ['Fried Specialties'])}
+        mod_items = {m: {'Order': 0.0} for m in ['By Itself'] + M}
+        rules = [('Fried Specialties', '', 'Specialty', S, '', None)]
+        for dish, var in (('Chicken Wings', 'Specialty'), ('Chicken Fingers', 'Specialty'), ('Teriyaki Beef', 'Order')):
+            rules += [('', dish, var, '', 'French Fries', 1.60), ('', dish, var, '', 'Plain Fried Rice', 2.40),
+                      ('', dish, var, '', 'Fried Rice', 2.40),
+                      ('', dish, var, '', 'Pork Fried Rice', 2.60 if dish == 'Teriyaki Beef' else 2.40)]
+        make_raw('raw.xlsx', 'R99941', 'Merge Wok', ['Order', 'Specialty'], dishes, mod_groups, mod_items, rules)
+        secs = [{'menu_section': 'Appetizers', 'price_columns': [], 'default_price': None,
+                 'items': [{'name': 'Egg Roll', 'prices': {'Order': 1.95}}]}]
+        if paper:
+            secs.append({'menu_section': 'Fried Specialties', 'price_columns': ['Specialty'], 'default_price': None,
+                         'side_pricing': {'columns': ['w. Plain Fried Rice']}, 'items': [
+                             {'name': 'Chicken Wings', 'prices': {'Specialty': 7.99},
+                              'side_prices': {'w. Plain Fried Rice': 10.79}}]})          # +2.80 (was 2.40)
+        json.dump({'restaurant': {'name': 'Merge Wok'}, 'sections': secs}, open('ocr.json', 'w'))
+        return ce.part1(scripts, compare=True)
+
+    out = setup('same', paper=False)
+    t, where = fs_tables()
+    visible = lambda tb: [h for h in t[tb][('Chicken Wings', 'Specialty')] if not h.startswith('_')
+                          and ('Rice' in h or 'Fries' in h)]
+    check('Plain Fried Rice and Fried Rice (same price on every row) share one column, on FULL PRICE too; Pork '
+          'Fried Rice (2.60 on Teriyaki Beef) and French Fries keep their own', out['cmp'][0] == 0
+          and visible('DIFF') == visible('FULL') == ['French Fries', 'Plain Fried Rice / Fried Rice', 'Pork Fried Rice'],
+          (visible('DIFF'), visible('FULL')))
+    wb = load_workbook('report.xlsx')
+    rr, h = where['DIFF'][('Chicken Wings', 'Specialty')]
+    wb[FS].cell(rr, h['Plain Fried Rice / Fried Rice']).value = 2.75
+    wb.save('edited.xlsx')
+    wbv = load_workbook('edited.xlsx')
+    check('the typed shared cell shows orange (an applied edit)',
+          cf_kind(wbv, wbv[FS], wbv[FS].cell(rr, h['Plain Fried Rice / Fried Rice']).coordinate, kind) == 'EDIT')
+    p2 = ce.part2(scripts, with_rules=True)
+    f = final_rules()
+    want = {('Chicken Wings', 'Specialty', 'Plain Fried Rice'): '$2.75',
+            ('Chicken Wings', 'Specialty', 'Fried Rice'): '$2.75',
+            ('Chicken Wings', 'Specialty', 'Pork Fried Rice'): '$2.40',
+            ('Chicken Fingers', 'Specialty', 'Plain Fried Rice'): '$2.40',
+            ('Chicken Fingers', 'Specialty', 'Fried Rice'): '$2.40'}
+    got = {k: f.get(k) for k in want}
+    check('Part 2 writes the one typed price to both rules of that dish and size, nothing else',
+          p2['apply'][0] == 0 and got == want, (p2['apply'][1][-300:], got))
+
+    setup('split', paper=True)
+    t, _w = fs_tables()
+    hdr = list(t['DIFF'][('Chicken Wings', 'Specialty')])
+    check('once only one of them is printed (Plain Fried Rice +2.80 blue; Fried Rice filled from it, purple — to '
+          'confirm) they are separate columns again', 'Plain Fried Rice' in hdr and 'Fried Rice' in hdr
+          and t['DIFF'][('Chicken Wings', 'Specialty')]['Plain Fried Rice'][::2] == (2.8, 'ADD8E6')
+          and t['DIFF'][('Chicken Wings', 'Specialty')]['Fried Rice'][::2] == (2.8, 'E4DFEC'),
+          {h: t['DIFF'][('Chicken Wings', 'Specialty')][h] for h in hdr if 'Rice' in h and not h.startswith('_')})
+
+
 def no_side_columns(scripts, work):
     print('\nA dish priced per dish only on By Itself (its sides priced once, on the items): no table, no false DRIFT')
     d = os.path.join(work, 'noside')
@@ -466,7 +532,7 @@ def main():
     bundle = os.path.abspath(sys.argv[1])
     scripts = os.path.join(bundle, 'menu-change-payload', 'scripts')
     work = tempfile.mkdtemp(prefix='fs_checks_')
-    for fn in (scenario_a, scenario_b, twin, no_side_columns, shared_prices):
+    for fn in (scenario_a, scenario_b, twin, merged_columns, no_side_columns, shared_prices):
         try:
             fn(scripts, work)
         except Exception as e:                         # a crash fails the check, never hides the rest

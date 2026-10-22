@@ -1,5 +1,15 @@
 # Changelog
 
+## v4.5.1 — Fried Specialty: sides at the same price share a column (2026-10-21)
+
+- On the Fried Specialty tab, side columns that hold the same price on every row merge into one
+  (e.g. `Plain Fried Rice / Fried Rice`). The specialist types the price once; Part 2 writes it to every
+  side in that column, for that dish and size.
+- Two sides merge only when nothing tells them apart. On every row, both must have a rule or both have
+  none, with the same live price, new price, source and printed total. A side the paper prints on its own,
+  or one that differs on a single dish, keeps its own column.
+- Reports made before this change read as before. They have no shared columns.
+
 ## v4.5 — Fried Specialty / Modifier Rule tabs (2026-10-16)
 
 The maintainer's request, with two decisions:

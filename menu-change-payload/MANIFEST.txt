@@ -124,3 +124,9 @@ table; the Fried Specialty tab rebuilt as FULL PRICE / PRICE DIFFERENCE /
 ABSOLUTE PRICE tables + Notes → Wonka; Questionnaire P-FS; apply reads the
 tables and reports tab conflicts), scripts/specialist_requests.py (the tab's
 notes), scripts/part2_report.py, ../menu-change-workflow-part1.md / part2.md.
+
+v4.5.1 AMENDMENT (Fried Specialty shared columns, 2026-10-21) — deliberate
+maintainer edit. Changed: scripts/modifier_rule_pricing.py (side columns that
+hold the same price on every row share one column on the Fried Specialty tab;
+apply writes a price typed there to each side in it). Unchanged: everything
+else. See ../CHANGELOG.md.
