@@ -1820,7 +1820,47 @@ def _fs_table(A):
             continue                              # nothing on this size has a price to change
         out.append({'key': key, 'group': groups[0] if groups else '', 'model': model, 'rules': rules[key],
                     'several': several, 'anchor': anchor})
-    return {'items': items, 'rows': out}
+    return {'items': items, 'rows': out, 'cols': _fs_merge_columns(A, items, out)}
+
+
+FS_COL_JOIN = ' / '
+
+
+def _fs_merge_columns(A, items, rows):
+    """Side columns that hold the same price on every row share one column
+    (maintainer, 2026-10-21: "Plain Fried Rice / Fried Rice" typed once, not
+    twice). Two sides merge only when, on every (dish, size), both have a rule
+    or both have none, and today's price, the new price, its source and the
+    printed total all agree — anything that tells them apart keeps them apart.
+    Returns [(label, [modifier items])], in items order."""
+    def sig(it):
+        out = []
+        for x in rows:
+            key = x['key']
+            if it not in x['rules']:
+                out.append(FS_NO_RULE)
+            elif it in x['several']:
+                out.append(FS_SEVERAL)
+            elif x['rules'][it] is None:
+                out.append(FS_NO_PRICE)
+            else:
+                old = round(x['rules'][it], 2)
+                new = A['final_prices'].get(key, {}).get(it, x['rules'][it])
+                printed = A['printed_total'].get(key, {}).get(it)
+                out.append((old, round(new, 2), A['price_sources'].get(key, {}).get(it, ''),
+                            round(printed, 2) if printed is not None else None))
+        return tuple(out)
+    by_sig = {}
+    for it in items:
+        by_sig.setdefault(sig(it), []).append(it)
+    cols, seen = [], set()
+    for it in items:
+        if it in seen:
+            continue
+        members = by_sig[sig(it)]
+        seen.update(members)
+        cols.append((FS_COL_JOIN.join(members), members))
+    return cols
 
 
 def _render_fs_tab(ws, A, drift=False):
@@ -1828,7 +1868,10 @@ def _render_fs_tab(ws, A, drift=False):
     ABSOLUTE PRICE, the Notes → Wonka box, then how the paper was read.
     Returns {'rows', 'delta', 'absolute'} counts."""
     tbl = _fs_table(A)
-    items, rows = tbl['items'], tbl['rows']
+    rows = tbl['rows']
+    members = dict(tbl['cols'])                # column label -> the side items it writes
+    items = [lab for lab, _m in tbl['cols']]   # one column per label; its first member stands for all
+    lead = {lab: ms[0] for lab, ms in tbl['cols']}
     C_GROUP, C_DISH, C_SIZE, C_PLAIN, C_ITEM0 = 1, 2, 3, 4, 5
     C_NOTES = C_ITEM0 + len(items)
     H0 = C_NOTES + 2                           # hidden block, after a blank spacer column
@@ -1841,6 +1884,7 @@ def _render_fs_tab(ws, A, drift=False):
     H1 = max(C_LIVE.values()) + 1
     C_CFREF = {nm: H1 + 2 * i for i, nm in enumerate(names)}
     C_CFLIVE = {nm: H1 + 1 + 2 * i for i, nm in enumerate(names)}
+    C_MODS = max(C_CFLIVE.values()) + 1        # hidden: which side items a shared column writes
     item_col = {it: C_ITEM0 + i for i, it in enumerate(items)}
     di_cells = _dish_item_cells(getattr(ws, 'parent', None))
     hidden_font = Font(color='808080', size=8)
@@ -1858,7 +1902,9 @@ def _render_fs_tab(ws, A, drift=False):
     ).font = Font(italic=True, color='7F6000')
     r += 1
     for line in ("Type new prices in PRICE DIFFERENCE and ABSOLUTE PRICE: plain numbers (1.20 — no + sign). "
-                 "Part 2 writes them to the system. FULL PRICE is the paper menu (grey = not printed: today's price).",
+                 "Part 2 writes them to the system. FULL PRICE is the paper menu (grey = not printed: today's price). "
+                 "Sides at the same price on every row share a column (e.g. \"Plain Fried Rice / Fried Rice\"): "
+                 "one price typed there is written to each of them.",
                  "Blue = up, pink = down (as printed), purple = not printed — filled from the printed dishes' same "
                  "change (confirm on the callback), green = the paper confirms today's price, orange = your edit, red "
                  "text = not applied (not a price, a misplaced decimal point, or a grey cell: that size has no rule "
@@ -1907,7 +1953,8 @@ def _render_fs_tab(ws, A, drift=False):
         c.number_format = '0.00'
         if printed_plain is None:
             c.font = TODAY_FONT
-        for it, ci in item_col.items():
+        for lab, ci in item_col.items():
+            it = lead[lab]
             c = ws.cell(row=r, column=ci)
             if it not in x['rules']:
                 c.fill = NO_RULE_FILL
@@ -1941,6 +1988,9 @@ def _render_fs_tab(ws, A, drift=False):
         for nm in names:
             ws.cell(row=r, column=C_REF[nm], value=f'_ref:{nm}').font = hidden_font
             ws.cell(row=r, column=C_LIVE[nm], value=f'_live:{nm}').font = hidden_font
+        shared = {lab: ms for lab, ms in members.items() if len(ms) > 1}
+        if shared:
+            ws.cell(row=r, column=C_MODS, value='_mods:' + json.dumps(shared)).font = hidden_font
         r += 1
         first = r
         for x in model_rows:
@@ -1950,7 +2000,7 @@ def _render_fs_tab(ws, A, drift=False):
             if absolute and x['anchor']:
                 ws.cell(row=r, column=C_ANCHOR, value=x['anchor']).font = hidden_font
             cols = [(FS_PLAIN, C_PLAIN, x['anchor'])] if absolute else []
-            cols += [(it, ci, it) for it, ci in item_col.items()]
+            cols += [(lab, ci, lead[lab]) for lab, ci in item_col.items()]
             for nm, ci, mod in cols:
                 c = ws.cell(row=r, column=ci)
                 c.number_format = '0.00'
@@ -2039,14 +2089,14 @@ def _render_fs_tab(ws, A, drift=False):
         r += 1
     r += 1
 
-    for c in range(H0, max(C_CFLIVE.values()) + 1):
+    for c in range(H0, C_MODS + 1):
         ws.column_dimensions[get_column_letter(c)].hidden = True
     ws.column_dimensions['A'].width = 18
     ws.column_dimensions['B'].width = 30
     ws.column_dimensions['C'].width = 12
     ws.column_dimensions['D'].width = 14
-    for ci in item_col.values():
-        ws.column_dimensions[get_column_letter(ci)].width = 13
+    for lab, ci in item_col.items():
+        ws.column_dimensions[get_column_letter(ci)].width = min(40, max(13, len(lab) + 2))
     ws.column_dimensions[get_column_letter(C_NOTES)].width = 40
     ws.sheet_properties.tabColor = RED_TAB
     # ── 5. how the paper was read: mappings, propagation, callback flags ──
@@ -2588,6 +2638,8 @@ def _read_fs(report_path, has_group=True):
             continue
         plain_col = next((j for h, j in col.items() if h.startswith('Plain')), None)
         hid_names = {h[len('_ref:'):] for h in col if h.startswith('_ref:')}
+        # a shared column (sides at the same price) writes each of its side items
+        shared = next((json.loads(h[len('_mods:'):]) for h in col if h.startswith('_mods:')), {})
         data = []
         for ri in range(hi + 1, len(rows)):
             r = rows[ri]
@@ -2665,7 +2717,8 @@ def _read_fs(report_path, has_group=True):
                     kind_ = 'part1'
                 else:
                     kind_ = ''
-                entries.append((key_of(dish, size, mod), price, kind_))
+                for m in (shared.get(nm) or [mod]) if nm != FS_PLAIN else [mod]:
+                    entries.append((key_of(dish, size, m), price, kind_))
     return entries, ignored
 
 
